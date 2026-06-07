@@ -26,17 +26,23 @@ func newTestPool() *keypool.Pool {
 	})
 }
 
+// newTestHandler 把上游注册为名为 "test" 的 workspace。
+// 测试请求路径需带 /test 前缀（如 /test/fixtures）。
 func newTestHandler(t *testing.T, upstreamURL string, pool *keypool.Pool) *Handler {
 	t.Helper()
 	return NewHandler(Config{
-		UpstreamBaseURL: upstreamURL,
-		Timeout:         5 * time.Second,
-		MaxRetries:      3,
+		Workspaces: map[string]WorkspaceUpstream{
+			"test": {BaseURL: upstreamURL, Timeout: 5 * time.Second},
+		},
+		MaxRetries: 3,
 	}, pool, auth.New(false, nil))
 }
 
 func TestServeHTTP_SuccessForwards(t *testing.T) {
+	var gotPath, gotQuery string
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotQuery = r.URL.RawQuery
 		w.Header().Set("x-ratelimit-requests-limit", "100")
 		w.Header().Set("x-ratelimit-requests-remaining", "50")
 		w.Header().Set("Content-Type", "application/json")
@@ -49,7 +55,7 @@ func TestServeHTTP_SuccessForwards(t *testing.T) {
 	h := newTestHandler(t, upstream.URL, pool)
 
 	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, "/fixtures?live=all", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test/fixtures?live=all", nil)
 	h.ServeHTTP(rec, req)
 
 	if rec.Code != 200 {
@@ -58,10 +64,75 @@ func TestServeHTTP_SuccessForwards(t *testing.T) {
 	if rec.Body.String() != `{"response":[]}` {
 		t.Errorf("body = %q", rec.Body.String())
 	}
+	// workspace 前缀必须被剥离：上游应收到 /fixtures 而非 /test/fixtures。
+	if gotPath != "/fixtures" {
+		t.Errorf("upstream path = %q, want /fixtures (workspace prefix stripped)", gotPath)
+	}
+	if gotQuery != "live=all" {
+		t.Errorf("upstream query = %q, want live=all", gotQuery)
+	}
 	for _, s := range pool.Snapshot() {
 		if s.Label == "key-1" && s.DailyRemaining != 50 {
 			t.Errorf("key-1 DailyRemaining = %d, want 50", s.DailyRemaining)
 		}
+	}
+}
+
+// TestServeHTTP_UnknownWorkspace404 验证未知 workspace 前缀返回 404。
+func TestServeHTTP_UnknownWorkspace404(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, upstream.URL, newTestPool())
+	rec := httptest.NewRecorder()
+	// "basketball" 未注册（只注册了 "test"）
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/basketball/games", nil))
+
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("status = %d, want 404 for unknown workspace", rec.Code)
+	}
+	var body errorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal 404 body: %v", err)
+	}
+	if body.Error != "unknown_workspace" {
+		t.Errorf("error = %q, want unknown_workspace", body.Error)
+	}
+}
+
+// TestServeHTTP_MultiWorkspaceRouting 验证不同 workspace 前缀路由到各自上游。
+func TestServeHTTP_MultiWorkspaceRouting(t *testing.T) {
+	footballSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("from-football:" + r.URL.Path))
+	}))
+	defer footballSrv.Close()
+	basketSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("from-basketball:" + r.URL.Path))
+	}))
+	defer basketSrv.Close()
+
+	h := NewHandler(Config{
+		Workspaces: map[string]WorkspaceUpstream{
+			"football":   {BaseURL: footballSrv.URL, Timeout: 5 * time.Second},
+			"basketball": {BaseURL: basketSrv.URL, Timeout: 5 * time.Second},
+		},
+		MaxRetries: 3,
+	}, newTestPool(), auth.New(false, nil))
+
+	rec1 := httptest.NewRecorder()
+	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/football/fixtures", nil))
+	if rec1.Body.String() != "from-football:/fixtures" {
+		t.Errorf("football route = %q, want from-football:/fixtures", rec1.Body.String())
+	}
+
+	rec2 := httptest.NewRecorder()
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/basketball/games", nil))
+	if rec2.Body.String() != "from-basketball:/games" {
+		t.Errorf("basketball route = %q, want from-basketball:/games", rec2.Body.String())
 	}
 }
 
@@ -99,13 +170,13 @@ func TestServeHTTP_ExhaustedKeySwitchesToNext(t *testing.T) {
 	h := newTestHandler(t, upstream.URL, pool)
 
 	rec1 := httptest.NewRecorder()
-	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/fixtures", nil))
+	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/test/fixtures", nil))
 	if rec1.Body.String() != `{"from":"key-1"}` {
 		t.Errorf("req1 body = %q, want from key-1", rec1.Body.String())
 	}
 
 	rec2 := httptest.NewRecorder()
-	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/fixtures", nil))
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/test/fixtures", nil))
 	if rec2.Body.String() != `{"from":"key-2"}` {
 		t.Errorf("req2 body = %q, want from key-2 (key-1 exhausted)", rec2.Body.String())
 	}
@@ -129,7 +200,7 @@ func TestServeHTTP_RateLimitedRetriesTransparently(t *testing.T) {
 	h := newTestHandler(t, upstream.URL, pool)
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fixtures", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/test/fixtures", nil))
 
 	if rec.Code != 200 {
 		t.Errorf("status = %d, want 200 (429 must not leak to downstream)", rec.Code)
@@ -150,7 +221,7 @@ func TestServeHTTP_AllKeysExhaustedReturns503(t *testing.T) {
 	h := newTestHandler(t, upstream.URL, pool)
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/fixtures", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/test/fixtures", nil))
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want 503", rec.Code)
@@ -189,7 +260,7 @@ func TestServeHTTP_ClientError4xxNotRetried(t *testing.T) {
 	h := newTestHandler(t, upstream.URL, pool)
 
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/nonexistent", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/test/nonexistent", nil))
 
 	if rec.Code != 404 {
 		t.Errorf("status = %d, want 404 (passed through)", rec.Code)
@@ -213,7 +284,7 @@ func TestServeHTTP_StripsAuthorizationEndToEnd(t *testing.T) {
 	pool := newTestPool()
 	h := newTestHandler(t, upstream.URL, pool)
 
-	req := httptest.NewRequest(http.MethodGet, "/fixtures", nil)
+	req := httptest.NewRequest(http.MethodGet, "/test/fixtures", nil)
 	req.Header.Set("Authorization", "Bearer downstream-token")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
@@ -229,7 +300,7 @@ func TestServeHTTP_NetworkErrorReturns503(t *testing.T) {
 	// 指向无人监听的端口，触发连接失败（网络层错误）。
 	h := newTestHandler(t, "http://127.0.0.1:1", newTestPool())
 	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/test/x", nil))
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503 on all-network-error", rec.Code)
@@ -261,7 +332,7 @@ func TestServeHTTP_PostBodyResentOnRetry(t *testing.T) {
 	defer upstream.Close()
 
 	h := newTestHandler(t, upstream.URL, newTestPool())
-	req := httptest.NewRequest(http.MethodPost, "/odds", strings.NewReader("payload-123"))
+	req := httptest.NewRequest(http.MethodPost, "/test/odds", strings.NewReader("payload-123"))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -292,7 +363,7 @@ func TestServeHTTP_ClientDisconnectDoesNotMarkKeyError(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // 立即取消，模拟客户端断连
-	req := httptest.NewRequest(http.MethodGet, "/fixtures", nil).WithContext(ctx)
+	req := httptest.NewRequest(http.MethodGet, "/test/fixtures", nil).WithContext(ctx)
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
@@ -300,6 +371,28 @@ func TestServeHTTP_ClientDisconnectDoesNotMarkKeyError(t *testing.T) {
 	for _, s := range pool.Snapshot() {
 		if s.Status == "error" {
 			t.Errorf("key %s marked error on client disconnect, want not-error", s.Label)
+		}
+	}
+}
+
+func TestSplitWorkspace(t *testing.T) {
+	cases := []struct {
+		path    string
+		wantWS  string
+		wantRst string
+	}{
+		{"/football/fixtures", "football", "/fixtures"},
+		{"/football/fixtures/123", "football", "/fixtures/123"},
+		{"/football", "football", "/"},
+		{"/", "", "/"},
+		{"", "", "/"},
+		{"/basketball/games", "basketball", "/games"},
+	}
+	for _, c := range cases {
+		gotWS, gotRst := splitWorkspace(c.path)
+		if gotWS != c.wantWS || gotRst != c.wantRst {
+			t.Errorf("splitWorkspace(%q) = (%q, %q), want (%q, %q)",
+				c.path, gotWS, gotRst, c.wantWS, c.wantRst)
 		}
 	}
 }

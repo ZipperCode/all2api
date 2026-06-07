@@ -49,6 +49,56 @@ func TestAuthorize_EnabledEmptyWhitelistRejectsAll(t *testing.T) {
 	}
 }
 
+// TestAuthorize_AcceptsXApisportsKeyHeader 验证客户端凭证也可放在 x-apisports-key 头。
+func TestAuthorize_AcceptsXApisportsKeyHeader(t *testing.T) {
+	a := New(true, []string{"good-token"})
+
+	// 仅用 x-apisports-key 头（无 Authorization）
+	req, _ := http.NewRequest(http.MethodGet, "/fixtures", nil)
+	req.Header.Set("x-apisports-key", "good-token")
+	if err := a.Authorize(req); err != nil {
+		t.Errorf("Authorize (valid x-apisports-key) = %v, want nil", err)
+	}
+
+	req2, _ := http.NewRequest(http.MethodGet, "/fixtures", nil)
+	req2.Header.Set("x-apisports-key", "bad-token")
+	if err := a.Authorize(req2); err == nil {
+		t.Error("Authorize (invalid x-apisports-key) = nil, want error")
+	}
+}
+
+// TestAuthorize_AuthorizationTakesPrecedence 验证 Authorization 优先于 x-apisports-key。
+func TestAuthorize_AuthorizationTakesPrecedence(t *testing.T) {
+	a := New(true, []string{"auth-token"})
+	req, _ := http.NewRequest(http.MethodGet, "/fixtures", nil)
+	req.Header.Set("Authorization", "Bearer auth-token") // 有效
+	req.Header.Set("x-apisports-key", "wrong")           // 无效但应被忽略
+	if err := a.Authorize(req); err != nil {
+		t.Errorf("Authorize (valid Authorization, ignore x-apisports-key) = %v, want nil", err)
+	}
+}
+
+func TestExtractClientToken(t *testing.T) {
+	// Authorization 优先
+	r1, _ := http.NewRequest(http.MethodGet, "/", nil)
+	r1.Header.Set("Authorization", "Bearer aaa")
+	r1.Header.Set("x-apisports-key", "bbb")
+	if got := extractClientToken(r1); got != "aaa" {
+		t.Errorf("extractClientToken (both) = %q, want aaa", got)
+	}
+	// 回退到 x-apisports-key
+	r2, _ := http.NewRequest(http.MethodGet, "/", nil)
+	r2.Header.Set("x-apisports-key", "bbb")
+	if got := extractClientToken(r2); got != "bbb" {
+		t.Errorf("extractClientToken (x-apisports-key only) = %q, want bbb", got)
+	}
+	// 都无
+	r3, _ := http.NewRequest(http.MethodGet, "/", nil)
+	if got := extractClientToken(r3); got != "" {
+		t.Errorf("extractClientToken (none) = %q, want empty", got)
+	}
+}
+
 func TestExtractBearer(t *testing.T) {
 	cases := []struct {
 		header string

@@ -12,12 +12,12 @@ import (
 
 // Config 是网关的完整配置。
 type Config struct {
-	Server     ServerConfig     `yaml:"server"`
-	Upstream   UpstreamConfig   `yaml:"upstream"`
-	Scheduler  SchedulerConfig  `yaml:"scheduler"`
-	Keys       []KeyConfig      `yaml:"keys"`
-	ClientAuth ClientAuthConfig `yaml:"client_auth"`
-	Logging    LoggingConfig    `yaml:"logging"`
+	Server     ServerConfig               `yaml:"server"`
+	Workspaces map[string]WorkspaceConfig `yaml:"workspaces"`
+	Scheduler  SchedulerConfig            `yaml:"scheduler"`
+	Keys       []KeyConfig                `yaml:"keys"`
+	ClientAuth ClientAuthConfig           `yaml:"client_auth"`
+	Logging    LoggingConfig              `yaml:"logging"`
 }
 
 // ServerConfig 控制 HTTP 监听地址。
@@ -26,8 +26,8 @@ type ServerConfig struct {
 	Port int    `yaml:"port"`
 }
 
-// UpstreamConfig 控制上游 API-Football 连接。
-type UpstreamConfig struct {
+// WorkspaceConfig 是单个 workspace（对应一个上游体育 API 子站）的配置。
+type WorkspaceConfig struct {
 	BaseURL        string `yaml:"base_url"`
 	TimeoutSeconds int    `yaml:"timeout_seconds"`
 }
@@ -118,8 +118,23 @@ func (c *Config) validate() error {
 	if c.Server.Host == "" {
 		c.Server.Host = "0.0.0.0"
 	}
-	if c.Upstream.BaseURL == "" {
-		return fmt.Errorf("config invalid: upstream.base_url is required")
+	if len(c.Workspaces) == 0 {
+		return fmt.Errorf("config invalid: at least one workspace is required")
+	}
+	for name, ws := range c.Workspaces {
+		if name == "" {
+			return fmt.Errorf("config invalid: workspace name must not be empty")
+		}
+		if strings.Contains(name, "/") {
+			return fmt.Errorf("config invalid: workspace name %q must not contain '/'", name)
+		}
+		if ws.BaseURL == "" {
+			return fmt.Errorf("config invalid: workspace %q has empty base_url", name)
+		}
+		if ws.TimeoutSeconds <= 0 {
+			ws.TimeoutSeconds = 30
+			c.Workspaces[name] = ws
+		}
 	}
 	if len(c.Keys) == 0 {
 		return fmt.Errorf("config invalid: at least one key is required")
@@ -131,9 +146,6 @@ func (c *Config) validate() error {
 		if k.Key == "" {
 			return fmt.Errorf("config invalid: keys[%d] (%s) has empty key value", i, c.Keys[i].Label)
 		}
-	}
-	if c.Upstream.TimeoutSeconds <= 0 {
-		c.Upstream.TimeoutSeconds = 30
 	}
 	if c.Scheduler.SwitchThreshold < 0 {
 		c.Scheduler.SwitchThreshold = 1

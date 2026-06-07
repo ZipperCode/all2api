@@ -7,39 +7,69 @@ import (
 	"log/slog"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"api-football-gateway/internal/auth"
 	"api-football-gateway/internal/keypool"
 )
 
+// splitWorkspace 从请求路径中分离 workspace 前缀与剩余路径。
+//
+//	"/football/fixtures?..." → ("football", "/fixtures")
+//	"/football"              → ("football", "/")
+//	"/"  或  ""              → ("", "/")
+//
+// 剩余路径总是以 "/" 开头，便于直接拼接上游 base_url。
+func splitWorkspace(path string) (workspace, rest string) {
+	trimmed := strings.TrimPrefix(path, "/")
+	if trimmed == "" {
+		return "", "/"
+	}
+	if i := strings.IndexByte(trimmed, '/'); i >= 0 {
+		return trimmed[:i], trimmed[i:]
+	}
+	return trimmed, "/"
+}
+
+// WorkspaceUpstream 描述单个 workspace 的上游连接参数。
+type WorkspaceUpstream struct {
+	BaseURL string
+	Timeout time.Duration
+}
+
 // Config 配置中转 handler。
 type Config struct {
-	UpstreamBaseURL string
-	Timeout         time.Duration
-	MaxRetries      int
+	// Workspaces 是 workspace 名 → 上游连接参数的映射。
+	// 下游请求路径形如 /<workspace>/<rest>，按 workspace 选对应上游。
+	Workspaces map[string]WorkspaceUpstream
+	MaxRetries int
 }
 
 // Handler 是网关的核心中转处理器。
 type Handler struct {
 	pool       *keypool.Pool
 	auth       *auth.Authenticator
-	transport  *transport
+	transports map[string]*transport // workspace 名 → 预构建的 transport
 	maxRetries int
 	logger     *slog.Logger
 }
 
-// NewHandler 构造中转 handler。
+// NewHandler 构造中转 handler，为每个 workspace 预构建一个 transport（复用连接池）。
 func NewHandler(cfg Config, pool *keypool.Pool, a *auth.Authenticator) *Handler {
 	maxRetries := cfg.MaxRetries
 	if maxRetries < 1 {
 		// 防御误配：MaxRetries<1 会导致每个请求直接 503。至少尝试一次。
 		maxRetries = 1
 	}
+	transports := make(map[string]*transport, len(cfg.Workspaces))
+	for name, ws := range cfg.Workspaces {
+		transports[name] = newTransport(ws.BaseURL, ws.Timeout)
+	}
 	return &Handler{
 		pool:       pool,
 		auth:       a,
-		transport:  newTransport(cfg.UpstreamBaseURL, cfg.Timeout),
+		transports: transports,
 		maxRetries: maxRetries,
 		logger:     slog.Default(),
 	}
@@ -51,12 +81,22 @@ func (h *Handler) WithLogger(l *slog.Logger) *Handler {
 	return h
 }
 
-// ServeHTTP 执行中转管线：认证 → 缓冲请求体 → 换 key 重试 → 回传。
+// ServeHTTP 执行中转管线：认证 → 解析 workspace → 缓冲请求体 → 换 key 重试 → 回传。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if err := h.auth.Authorize(r); err != nil {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized", "client authorization failed", nil, 0)
 		return
 	}
+
+	// 解析路径前缀 /<workspace>/<rest>，选定对应上游 transport，并把剩余路径设回请求。
+	workspace, rest := splitWorkspace(r.URL.Path)
+	tr, ok := h.transports[workspace]
+	if !ok {
+		writeJSONError(w, http.StatusNotFound, "unknown_workspace",
+			"unknown workspace in path; expected /<workspace>/<path>", nil, 0)
+		return
+	}
+	r.URL.Path = rest
 
 	var bodyBytes []byte
 	if r.Body != nil {
@@ -84,7 +124,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			attemptReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
-		res := h.transport.do(attemptReq, handle.Key())
+		res := tr.do(attemptReq, handle.Key())
 
 		switch res.kind {
 		case outcomeSuccess:

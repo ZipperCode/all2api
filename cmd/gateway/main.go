@@ -46,10 +46,16 @@ func main() {
 
 	authenticator := auth.New(cfg.ClientAuth.Enabled, cfg.ClientAuth.Tokens)
 
+	workspaces := make(map[string]proxy.WorkspaceUpstream, len(cfg.Workspaces))
+	for name, ws := range cfg.Workspaces {
+		workspaces[name] = proxy.WorkspaceUpstream{
+			BaseURL: ws.BaseURL,
+			Timeout: time.Duration(ws.TimeoutSeconds) * time.Second,
+		}
+	}
 	proxyHandler := proxy.NewHandler(proxy.Config{
-		UpstreamBaseURL: cfg.Upstream.BaseURL,
-		Timeout:         time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second,
-		MaxRetries:      cfg.Scheduler.MaxRetries,
+		Workspaces: workspaces,
+		MaxRetries: cfg.Scheduler.MaxRetries,
 	}, pool, authenticator).WithLogger(logger)
 
 	adminHandler := admin.New(pool)
@@ -65,10 +71,15 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second, // 防慢连接长期占用 goroutine
 	}
 
+	wsNames := make([]string, 0, len(cfg.Workspaces))
+	for name := range cfg.Workspaces {
+		wsNames = append(wsNames, name)
+	}
+
 	go func() {
 		logger.Info("gateway listening",
 			"addr", addr,
-			"upstream", cfg.Upstream.BaseURL,
+			"workspaces", strings.Join(wsNames, ","),
 			"keys", len(cfg.Keys),
 			"client_auth", cfg.ClientAuth.Enabled)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {

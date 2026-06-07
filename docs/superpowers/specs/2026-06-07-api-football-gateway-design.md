@@ -1,8 +1,19 @@
 # API-Football 多 Key 请求网关 — 设计文档
 
 - **日期**：2026-06-07
-- **状态**：待用户审查
+- **状态**：已实现
 - **项目路径**：`~/Projects/api-football-gateway/`
+
+## 0. v2 增量变更（workspace 路由 + 双认证位）
+
+初版实现后，按"下游零改造迁移 + 一套 key 访问多个体育 API"诉求做了如下增量（不改变下游无感知、顺序耗尽、内存状态等核心设计）：
+
+1. **多 workspace 路由**：配置从单 `upstream.base_url` 升级为 `workspaces` 映射（每个 workspace 一个 base_url + timeout）。下游请求路径 `/<workspace>/<原路径>` → 网关剥离 `/<workspace>` 前缀 → 转发到该 workspace 对应上游。一套 key 池被所有 workspace 共享（契合 API-Sports 同 key 多子站特性）。未知 workspace 返回 404 `unknown_workspace`。
+   - 实现：`proxy.Handler` 持有 `map[workspace]*transport`，每 workspace 一个 transport（独立连接池）；`splitWorkspace` 解析前缀。
+2. **双认证位**：客户端凭证可放 `Authorization: Bearer <token>` **或** `x-apisports-key: <token>`（与上游同名头，下游可零改造沿用）。`auth.extractClientToken` 依次尝试两个位置，Authorization 优先。初版仍不校验、剥离后注入真实 key。
+3. **下游迁移成本**：仅改 baseUrl（加网关地址 + workspace 前缀），路径格式与认证方式不变。
+
+下文第 1-8 节为初版设计，除"单 upstream → 多 workspaces"与"单一认证位 → 双认证位"两处外均仍有效。
 
 ## 1. 背景与目标
 

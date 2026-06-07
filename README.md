@@ -1,13 +1,16 @@
 # API-Football Gateway
 
-局域网内的 API-Football 多 key 请求网关。对客户端屏蔽真实密钥，在多个 key 间**顺序耗尽式轮换**，实时监控各 key 当日额度，上游错误时**自动换 key 重试且对下游透明**。
+局域网内的 API-Sports 多 key 请求网关。对客户端屏蔽真实密钥，在多个 key 间**顺序耗尽式轮换**，通过 **workspace 前缀**把一套 key 路由到多个体育 API 子站，实时监控各 key 当日额度，上游错误时**自动换 key 重试且对下游透明**。
 
 ## 特性
 
 - **多 key 顺序耗尽**：固定用 key-1 直到当日额度耗尽，再自动切到 key-2……把多个 key 当成一个大额度池。
+- **多 workspace 路由**：下游请求路径 `/<workspace>/<原路径>` 按 workspace 选上游（football/basketball/baseball...），一套 key 池被所有 workspace 共享。
+- **下游零改造迁移**：下游只需把 baseUrl 改成 `http://<网关>/<workspace>`，**原路径格式与认证方式都不变**。
+- **双认证位**：客户端凭证可放 `Authorization: Bearer <token>` **或** `x-apisports-key: <token>`（与上游同名头，下游沿用原有写法即可）。初版不校验，预留启用钩子。
 - **下游无感知**：上游返回 429 / 额度耗尽 / 401 / 403 / 5xx / 网络错误时，网关内部静默换 key 重试，客户端只看到最终成功响应或全部失败的 503。
 - **实时额度监控**：额度数据完全来自上游响应 header（`x-ratelimit-*`），网关不自行计数，重启自愈。
-- **凭证隔离**：客户端用 `Authorization: Bearer <token>`（初版不校验，预留钩子），与上游真实 `x-apisports-key` 彻底分离。
+- **凭证隔离**：客户端凭证与上游真实 `x-apisports-key` 彻底分离。
 - **内存状态**：无数据库依赖，单二进制部署。
 
 ## 快速开始
@@ -27,15 +30,29 @@
    go build -o gateway ./cmd/gateway && ./gateway -config config.yaml
    ```
 
-3. 请求端改造：把 baseUrl 指向网关，`Authorization` 任意填（初版不校验）：
+3. 请求端改造：**只改 baseUrl**——加上网关地址和 workspace 前缀，路径格式和认证方式都不变：
 
    ```bash
    # 原本: https://v3.football.api-sports.io/fixtures?live=all
+   # 改为: http://<网关LAN_IP>:8080/football/fixtures?live=all
+   #                                  ^^^^^^^^ workspace 前缀
+
+   # 认证位两种都支持（初版不校验，任意值即可）：
    curl -H "Authorization: Bearer anything" \
-        "http://<网关LAN_IP>:8080/fixtures?live=all"
+        "http://<网关LAN_IP>:8080/football/fixtures?live=all"
+   # 或沿用原有的 x-apisports-key 写法（下游零改造）：
+   curl -H "x-apisports-key: anything" \
+        "http://<网关LAN_IP>:8080/football/fixtures?live=all"
    ```
 
-   网关会剥离 `Authorization`、注入真实 `x-apisports-key`、转发到上游，并原样回传响应。
+   网关会：剥离 workspace 前缀 → 剥离客户端凭证 → 选 key 注入真实 `x-apisports-key` → 转发到该 workspace 对应上游 → 原样回传响应。
+
+   不同体育 API 用不同前缀：
+
+   ```bash
+   http://<网关>/football/fixtures?live=all  → https://v3.football.api-sports.io/fixtures?live=all
+   http://<网关>/basketball/games            → https://v1.basketball.api-sports.io/games
+   ```
 
 ## 配置说明
 
@@ -44,9 +61,9 @@
 | 配置 | 说明 |
 |------|------|
 | `server.host` / `server.port` | 监听地址（局域网部署用 `0.0.0.0`） |
-| `upstream.base_url` | 上游地址，官方直连为 `https://v3.football.api-sports.io` |
-| `upstream.timeout_seconds` | 单次上游请求超时（默认 30） |
-| `keys` | 真实 key 列表，按顺序耗尽使用 |
+| `workspaces.<名>.base_url` | 该 workspace 对应的上游地址（如 football → `https://v3.football.api-sports.io`） |
+| `workspaces.<名>.timeout_seconds` | 该 workspace 单次上游请求超时（默认 30） |
+| `keys` | 真实 key 列表，按顺序耗尽使用，被所有 workspace 共享 |
 | `scheduler.switch_threshold` | 当日剩余 <= 此值即视为耗尽并切换（默认 1） |
 | `scheduler.rate_limit_cooldown_seconds` | 429 后该 key 退避时长（默认 60） |
 | `scheduler.error_cooldown_seconds` | 连续错误后退避时长（默认 30） |
@@ -71,7 +88,7 @@
 | `GET /__gateway/status` | 各 key 脱敏额度状态 JSON（key 仅显示 `****` + 尾 4 位） |
 | `GET /__gateway/health` | 健康检查，返回 `{"status":"ok"}` |
 
-`/__gateway/` 为管理命名空间，其余所有路径一律转发上游（天然支持上游全部端点）。
+`/__gateway/` 为管理命名空间（不受 workspace 路由影响），其余所有路径按 `/<workspace>/...` 转发到对应上游。
 
 示例：
 

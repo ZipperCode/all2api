@@ -23,9 +23,12 @@ const validYAML = `
 server:
   host: "0.0.0.0"
   port: 8080
-upstream:
-  base_url: "https://v3.football.api-sports.io"
-  timeout_seconds: 30
+workspaces:
+  football:
+    base_url: "https://v3.football.api-sports.io"
+    timeout_seconds: 30
+  basketball:
+    base_url: "https://v1.basketball.api-sports.io"
 scheduler:
   switch_threshold: 1
   rate_limit_cooldown_seconds: 60
@@ -66,8 +69,14 @@ func TestLoad_ValidConfig(t *testing.T) {
 	if cfg.Server.Port != 8080 {
 		t.Errorf("Server.Port = %d, want 8080", cfg.Server.Port)
 	}
-	if cfg.Upstream.BaseURL != "https://v3.football.api-sports.io" {
-		t.Errorf("Upstream.BaseURL = %q", cfg.Upstream.BaseURL)
+	if len(cfg.Workspaces) != 2 {
+		t.Errorf("Workspaces count = %d, want 2", len(cfg.Workspaces))
+	}
+	if cfg.Workspaces["football"].BaseURL != "https://v3.football.api-sports.io" {
+		t.Errorf("football BaseURL = %q", cfg.Workspaces["football"].BaseURL)
+	}
+	if cfg.Workspaces["basketball"].BaseURL != "https://v1.basketball.api-sports.io" {
+		t.Errorf("basketball BaseURL = %q", cfg.Workspaces["basketball"].BaseURL)
 	}
 	if cfg.Scheduler.SwitchThreshold != 1 {
 		t.Errorf("SwitchThreshold = %d, want 1", cfg.Scheduler.SwitchThreshold)
@@ -109,7 +118,9 @@ func TestValidate_Errors(t *testing.T) {
 		{"no keys", func(c *Config) { c.Keys = nil }, "at least one key"},
 		{"empty key value", func(c *Config) { c.Keys[0].Key = "" }, "empty key"},
 		{"bad port", func(c *Config) { c.Server.Port = 0 }, "server.port"},
-		{"empty base_url", func(c *Config) { c.Upstream.BaseURL = "" }, "upstream.base_url"},
+		{"empty workspace base_url", func(c *Config) { c.Workspaces["football"] = WorkspaceConfig{BaseURL: ""} }, "empty base_url"},
+		{"no workspaces", func(c *Config) { c.Workspaces = nil }, "at least one workspace"},
+		{"workspace name with slash", func(c *Config) { c.Workspaces["a/b"] = WorkspaceConfig{BaseURL: "https://x"} }, "must not contain"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -129,15 +140,15 @@ func TestValidate_Errors(t *testing.T) {
 func TestValidate_AppliesDefaults(t *testing.T) {
 	cfg := mustParse(t, validYAML)
 	cfg.Scheduler.MaxRetries = 0
-	cfg.Upstream.TimeoutSeconds = 0
+	// basketball workspace 未设 timeout，应被填默认 30
 	if err := cfg.validate(); err != nil {
 		t.Fatalf("validate: %v", err)
 	}
 	if cfg.Scheduler.MaxRetries != 3 {
 		t.Errorf("MaxRetries default = %d, want 3", cfg.Scheduler.MaxRetries)
 	}
-	if cfg.Upstream.TimeoutSeconds != 30 {
-		t.Errorf("TimeoutSeconds default = %d, want 30", cfg.Upstream.TimeoutSeconds)
+	if cfg.Workspaces["basketball"].TimeoutSeconds != 30 {
+		t.Errorf("basketball TimeoutSeconds default = %d, want 30", cfg.Workspaces["basketball"].TimeoutSeconds)
 	}
 }
 
@@ -146,8 +157,9 @@ func TestLoad_DefaultValues(t *testing.T) {
 	minYAML := `
 server:
   port: 8080
-upstream:
-  base_url: "https://example.com"
+workspaces:
+  football:
+    base_url: "https://example.com"
 keys:
   - key: "k1"
 `
@@ -159,8 +171,8 @@ keys:
 	if cfg.Server.Host != "0.0.0.0" {
 		t.Errorf("Host default = %q, want 0.0.0.0", cfg.Server.Host)
 	}
-	if cfg.Upstream.TimeoutSeconds != 30 {
-		t.Errorf("TimeoutSeconds default = %d, want 30", cfg.Upstream.TimeoutSeconds)
+	if cfg.Workspaces["football"].TimeoutSeconds != 30 {
+		t.Errorf("football TimeoutSeconds default = %d, want 30", cfg.Workspaces["football"].TimeoutSeconds)
 	}
 	if cfg.Scheduler.MaxRetries != 3 {
 		t.Errorf("MaxRetries default = %d, want 3", cfg.Scheduler.MaxRetries)
