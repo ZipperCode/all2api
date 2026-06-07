@@ -31,11 +31,16 @@ type Handler struct {
 
 // NewHandler 构造中转 handler。
 func NewHandler(cfg Config, pool *keypool.Pool, a *auth.Authenticator) *Handler {
+	maxRetries := cfg.MaxRetries
+	if maxRetries < 1 {
+		// 防御误配：MaxRetries<1 会导致每个请求直接 503。至少尝试一次。
+		maxRetries = 1
+	}
 	return &Handler{
 		pool:       pool,
 		auth:       a,
 		transport:  newTransport(cfg.UpstreamBaseURL, cfg.Timeout),
-		maxRetries: cfg.MaxRetries,
+		maxRetries: maxRetries,
 		logger:     slog.Default(),
 	}
 }
@@ -72,6 +77,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 		attempts++
 
+		// 每次尝试用全新的 body reader，保证换 key 重试时请求体可重发。
+		// bodyBytes 为 nil 表示原请求无 body；为零长非 nil 表示显式空 body，均正确保留。
 		attemptReq := r.Clone(r.Context())
 		if bodyBytes != nil {
 			attemptReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))

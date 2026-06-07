@@ -47,9 +47,9 @@ func newTransport(baseURL string, timeout time.Duration) *transport {
 // do 用给定真实 key 向上游发起一次请求，返回已缓冲的结果。
 // 注入 x-apisports-key；不透传下游 Authorization（构造全新请求头）。
 func (t *transport) do(clientReq *http.Request, apiKey string) upstreamResult {
-	url := t.baseURL + clientReq.URL.Path
+	rawURL := t.baseURL + clientReq.URL.Path
 	if clientReq.URL.RawQuery != "" {
-		url += "?" + clientReq.URL.RawQuery
+		rawURL += "?" + clientReq.URL.RawQuery
 	}
 
 	var bodyReader io.Reader
@@ -57,7 +57,7 @@ func (t *transport) do(clientReq *http.Request, apiKey string) upstreamResult {
 		bodyReader = clientReq.Body
 	}
 
-	upReq, err := http.NewRequestWithContext(clientReq.Context(), clientReq.Method, url, bodyReader)
+	upReq, err := http.NewRequestWithContext(clientReq.Context(), clientReq.Method, rawURL, bodyReader)
 	if err != nil {
 		return upstreamResult{kind: outcomeServerError, err: err}
 	}

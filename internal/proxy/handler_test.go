@@ -2,8 +2,10 @@ package proxy
 
 import (
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -217,5 +219,60 @@ func TestServeHTTP_StripsAuthorizationEndToEnd(t *testing.T) {
 
 	if sawAuth != "" {
 		t.Errorf("upstream saw Authorization = %q, want empty", sawAuth)
+	}
+}
+
+// TestServeHTTP_NetworkErrorReturns503 验证上游网络不可达时，handler 走 serverError
+// 路径换 key 重试，最终所有尝试失败 → 503（下游不感知中间网络错误）。
+func TestServeHTTP_NetworkErrorReturns503(t *testing.T) {
+	// 指向无人监听的端口，触发连接失败（网络层错误）。
+	h := newTestHandler(t, "http://127.0.0.1:1", newTestPool())
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/x", nil))
+
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("status = %d, want 503 on all-network-error", rec.Code)
+	}
+	var body errorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal 503 body: %v", err)
+	}
+	if body.Error != "all_keys_unavailable" {
+		t.Errorf("error = %q, want all_keys_unavailable", body.Error)
+	}
+}
+
+// TestServeHTTP_PostBodyResentOnRetry 验证非 GET 请求体在换 key 重试时被完整重发——
+// 下游无感知对带 body 请求的核心保证。
+func TestServeHTTP_PostBodyResentOnRetry(t *testing.T) {
+	var gotBodies []string
+	// key-1 返回 429 触发换 key；每次都记录收到的 body，验证重试时 body 完整重发。
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		gotBodies = append(gotBodies, string(b))
+		if r.Header.Get("x-apisports-key") == "secret-aaaa1" {
+			w.WriteHeader(429)
+			return
+		}
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte(`{"ok":true}`))
+	}))
+	defer upstream.Close()
+
+	h := newTestHandler(t, upstream.URL, newTestPool())
+	req := httptest.NewRequest(http.MethodPost, "/odds", strings.NewReader("payload-123"))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200 after retry", rec.Code)
+	}
+	if len(gotBodies) != 2 {
+		t.Fatalf("upstream received %d requests, want 2 (original + retry)", len(gotBodies))
+	}
+	for i, b := range gotBodies {
+		if b != "payload-123" {
+			t.Errorf("attempt %d body = %q, want payload-123 (body must be re-sent intact)", i+1, b)
+		}
 	}
 }
