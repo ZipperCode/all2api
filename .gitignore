@@ -14,3 +14,6 @@ coverage.html
 .idea/
 .vscode/
 *.swp
+
+# 工具本地元数据
+.serena/
