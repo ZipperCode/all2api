@@ -1,0 +1,16 @@
+# 真实配置（含密钥），不提交
+config.yaml
+
+# 编译产物
+/gateway
+/bin/
+*.exe
+
+# 测试与覆盖率
+*.out
+coverage.html
+
+# 编辑器
+.idea/
+.vscode/
+*.swp
