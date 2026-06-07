@@ -46,6 +46,12 @@ func TestHealthEndpoint(t *testing.T) {
 	if rec.Code != 200 {
 		t.Errorf("health status = %d, want 200", rec.Code)
 	}
+	if ct := rec.Header().Get("Content-Type"); ct != "application/json" {
+		t.Errorf("health Content-Type = %q, want application/json", ct)
+	}
+	if body := strings.TrimSpace(rec.Body.String()); body != `{"status":"ok"}` {
+		t.Errorf("health body = %q, want {\"status\":\"ok\"}", body)
+	}
 }
 
 func TestUnknownAdminPath404(t *testing.T) {

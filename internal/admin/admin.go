@@ -3,6 +3,7 @@ package admin
 
 import (
 	"encoding/json"
+	"log/slog"
 	"net/http"
 
 	"api-football-gateway/internal/keypool"
@@ -38,7 +39,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) handleStatus(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(w).Encode(StatusResponse{Keys: h.pool.Snapshot()})
+	if err := json.NewEncoder(w).Encode(StatusResponse{Keys: h.pool.Snapshot()}); err != nil {
+		// 响应头已发送，无法回退状态码；仅记录便于运营排查。
+		slog.Error("admin: failed to encode status response", "error", err)
+	}
 }
 
 func (h *Handler) handleHealth(w http.ResponseWriter, _ *http.Request) {
