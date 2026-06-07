@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -273,6 +274,32 @@ func TestServeHTTP_PostBodyResentOnRetry(t *testing.T) {
 	for i, b := range gotBodies {
 		if b != "payload-123" {
 			t.Errorf("attempt %d body = %q, want payload-123 (body must be re-sent intact)", i+1, b)
+		}
+	}
+}
+
+// TestServeHTTP_ClientDisconnectDoesNotMarkKeyError 验证客户端断连（context 取消）时，
+// handler 中止处理且不把健康 key 误标为错误。
+func TestServeHTTP_ClientDisconnectDoesNotMarkKeyError(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// 上游正常，但客户端 context 已取消，transport 会返回 context.Canceled。
+		w.WriteHeader(200)
+	}))
+	defer upstream.Close()
+
+	pool := newTestPool()
+	h := newTestHandler(t, upstream.URL, pool)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel() // 立即取消，模拟客户端断连
+	req := httptest.NewRequest(http.MethodGet, "/fixtures", nil).WithContext(ctx)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	// key 不应被标记为 error（断连非 key 的错）——所有 key 仍应可用。
+	for _, s := range pool.Snapshot() {
+		if s.Status == "error" {
+			t.Errorf("key %s marked error on client disconnect, want not-error", s.Label)
 		}
 	}
 }

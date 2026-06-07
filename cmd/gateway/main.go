@@ -60,8 +60,9 @@ func main() {
 
 	addr := cfg.Server.Host + ":" + strconv.Itoa(cfg.Server.Port)
 	srv := &http.Server{
-		Addr:    addr,
-		Handler: mux,
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 10 * time.Second, // 防慢连接长期占用 goroutine
 	}
 
 	go func() {

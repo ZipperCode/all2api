@@ -130,6 +130,26 @@ func TestAcquire_CrossDayResetsExhausted(t *testing.T) {
 	}
 }
 
+func TestUpdateFromUpstream_ReturnsJustExhausted(t *testing.T) {
+	p := newTestPool(t) // SwitchThreshold=1
+	// 剩余 50 > 阈值 → 未耗尽，返回 false
+	if got := p.UpdateFromUpstream("key-1", RateLimitSnapshot{HasDaily: true, DailyLimit: 100, DailyRemaining: 50}); got {
+		t.Errorf("UpdateFromUpstream(remaining=50) = true, want false")
+	}
+	// 剩余 1 <= 阈值 1 → 耗尽，返回 true
+	if got := p.UpdateFromUpstream("key-1", RateLimitSnapshot{HasDaily: true, DailyLimit: 100, DailyRemaining: 1}); !got {
+		t.Errorf("UpdateFromUpstream(remaining=1) = false, want true (just exhausted)")
+	}
+	// 无 daily 信息 → 不判定耗尽，返回 false
+	if got := p.UpdateFromUpstream("key-2", RateLimitSnapshot{HasMinute: true, MinuteRemaining: 5}); got {
+		t.Errorf("UpdateFromUpstream(no daily) = true, want false")
+	}
+	// 未知 label → false
+	if got := p.UpdateFromUpstream("nope", RateLimitSnapshot{HasDaily: true, DailyRemaining: 0}); got {
+		t.Errorf("UpdateFromUpstream(unknown label) = true, want false")
+	}
+}
+
 func statusOf(t *testing.T, p *Pool, label string) string {
 	t.Helper()
 	for _, s := range p.Snapshot() {

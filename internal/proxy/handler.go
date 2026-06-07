@@ -88,7 +88,12 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 		switch res.kind {
 		case outcomeSuccess:
-			h.pool.UpdateFromUpstream(handle.Label(), res.snapshot)
+			justExhausted := h.pool.UpdateFromUpstream(handle.Label(), res.snapshot)
+			// 若本次成功后该 key 当日额度恰好耗尽，记 INFO 便于运营感知后续切换。
+			if justExhausted {
+				h.logger.Info("key exhausted after this response, will switch on next request",
+					"key", handle.Label(), "daily_remaining", res.snapshot.DailyRemaining)
+			}
 			h.writeUpstreamResponse(w, res)
 			return
 
@@ -105,6 +110,11 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			continue
 
 		case outcomeServerError:
+			// 客户端断连导致的 context 取消不计为 key 错误，且重试无意义（无人接收响应）。
+			if r.Context().Err() != nil {
+				h.logger.Warn("client disconnected, aborting", "key", handle.Label())
+				return
+			}
 			reason := "upstream server error"
 			if res.err != nil {
 				reason = res.err.Error()

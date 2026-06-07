@@ -233,16 +233,17 @@ func (p *Pool) MarkKeyInvalid(label, reason string) {
 
 // UpdateFromUpstream 用上游响应额度快照更新 key 状态。
 // 若当日剩余 <= SwitchThreshold，标记为 Exhausted（不影响本次已完成的请求）。
+// 返回值表示本次更新是否使该 key 转入耗尽（供调用方记录切换日志）。
 //
 // 调用契约：仅应在某个 Acquire 返回的 key 收到其对应上游响应后调用，
 // 用该次响应的快照更新自身状态。一次成功响应即视为该 key 工作正常，
 // 因此无条件清零累计错误计数。
-func (p *Pool) UpdateFromUpstream(label string, snap RateLimitSnapshot) {
+func (p *Pool) UpdateFromUpstream(label string, snap RateLimitSnapshot) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	k := p.findLocked(label)
 	if k == nil {
-		return
+		return false
 	}
 	now := p.now()
 	if snap.HasDaily {
@@ -258,7 +259,9 @@ func (p *Pool) UpdateFromUpstream(label string, snap RateLimitSnapshot) {
 	k.status = StatusActive
 	if snap.HasDaily && snap.DailyRemaining <= p.opts.SwitchThreshold {
 		k.status = StatusExhausted
+		return true
 	}
+	return false
 }
 
 // defaultRetryAfterSeconds 是无法精确计算恢复时间时的兜底。
