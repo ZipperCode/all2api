@@ -68,7 +68,9 @@ func Load(path string) (*Config, error) {
 	if err := yaml.Unmarshal(raw, &cfg); err != nil {
 		return nil, fmt.Errorf("parse yaml: %w", err)
 	}
-	applyEnvOverrides(&cfg)
+	if err := applyEnvOverrides(&cfg); err != nil {
+		return nil, err
+	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
 	}
@@ -77,11 +79,14 @@ func Load(path string) (*Config, error) {
 
 // applyEnvOverrides 用环境变量覆盖敏感/可变字段。
 // GW_SERVER_PORT 覆盖监听端口；GW_KEY_<LABEL> 覆盖对应 label 的真实 key。
-func applyEnvOverrides(cfg *Config) {
+// 显式提供但非法的值会返回错误（fail-fast），避免静默回退到 YAML 值。
+func applyEnvOverrides(cfg *Config) error {
 	if v := os.Getenv("GW_SERVER_PORT"); v != "" {
-		if port, err := strconv.Atoi(v); err == nil {
-			cfg.Server.Port = port
+		port, err := strconv.Atoi(v)
+		if err != nil {
+			return fmt.Errorf("GW_SERVER_PORT=%q is not a valid port number: %w", v, err)
 		}
+		cfg.Server.Port = port
 	}
 	for i := range cfg.Keys {
 		envName := "GW_KEY_" + sanitizeEnvLabel(cfg.Keys[i].Label)
@@ -89,6 +94,7 @@ func applyEnvOverrides(cfg *Config) {
 			cfg.Keys[i].Key = v
 		}
 	}
+	return nil
 }
 
 // sanitizeEnvLabel 将 label 转为环境变量后缀：大写，非字母数字转下划线。
@@ -119,11 +125,11 @@ func (c *Config) validate() error {
 		return fmt.Errorf("config invalid: at least one key is required")
 	}
 	for i, k := range c.Keys {
-		if k.Key == "" {
-			return fmt.Errorf("config invalid: keys[%d] (%s) has empty key value", i, k.Label)
-		}
 		if k.Label == "" {
 			c.Keys[i].Label = fmt.Sprintf("key-%d", i+1)
+		}
+		if k.Key == "" {
+			return fmt.Errorf("config invalid: keys[%d] (%s) has empty key value", i, c.Keys[i].Label)
 		}
 	}
 	if c.Upstream.TimeoutSeconds <= 0 {

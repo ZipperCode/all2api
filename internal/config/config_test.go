@@ -140,3 +140,48 @@ func TestValidate_AppliesDefaults(t *testing.T) {
 		t.Errorf("TimeoutSeconds default = %d, want 30", cfg.Upstream.TimeoutSeconds)
 	}
 }
+
+// TestLoad_DefaultValues 走完整 Load 路径，验证最小配置经 Load 后正确填充默认值。
+func TestLoad_DefaultValues(t *testing.T) {
+	minYAML := `
+server:
+  port: 8080
+upstream:
+  base_url: "https://example.com"
+keys:
+  - key: "k1"
+`
+	p := writeTempConfig(t, minYAML)
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.Server.Host != "0.0.0.0" {
+		t.Errorf("Host default = %q, want 0.0.0.0", cfg.Server.Host)
+	}
+	if cfg.Upstream.TimeoutSeconds != 30 {
+		t.Errorf("TimeoutSeconds default = %d, want 30", cfg.Upstream.TimeoutSeconds)
+	}
+	if cfg.Scheduler.MaxRetries != 3 {
+		t.Errorf("MaxRetries default = %d, want 3", cfg.Scheduler.MaxRetries)
+	}
+	if cfg.Logging.Level != "info" {
+		t.Errorf("Logging.Level default = %q, want info", cfg.Logging.Level)
+	}
+	if cfg.Keys[0].Label != "key-1" {
+		t.Errorf("empty label default = %q, want key-1", cfg.Keys[0].Label)
+	}
+}
+
+// TestLoad_InvalidEnvPort 验证非法 GW_SERVER_PORT 触发 fail-fast 错误（不静默回退）。
+func TestLoad_InvalidEnvPort(t *testing.T) {
+	p := writeTempConfig(t, validYAML)
+	t.Setenv("GW_SERVER_PORT", "not-a-number")
+	_, err := Load(p)
+	if err == nil {
+		t.Fatal("Load with invalid GW_SERVER_PORT = nil error, want error")
+	}
+	if !strings.Contains(err.Error(), "GW_SERVER_PORT") {
+		t.Errorf("error = %q, want substring GW_SERVER_PORT", err.Error())
+	}
+}
