@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"errors"
 	"net/http"
 	"testing"
 )
@@ -34,6 +35,17 @@ func TestAuthorize_EnabledChecksToken(t *testing.T) {
 	req.Header.Del("Authorization")
 	if err := a.Authorize(req); err == nil {
 		t.Error("Authorize (missing token when enabled) = nil, want error")
+	}
+}
+
+// TestAuthorize_EnabledEmptyWhitelistRejectsAll 验证 fail-closed 语义：
+// 启用认证但白名单为空时，任何 token 都应被拒绝。
+func TestAuthorize_EnabledEmptyWhitelistRejectsAll(t *testing.T) {
+	a := New(true, nil)
+	req, _ := http.NewRequest(http.MethodGet, "/", nil)
+	req.Header.Set("Authorization", "Bearer any-token")
+	if err := a.Authorize(req); !errors.Is(err, ErrUnauthorized) {
+		t.Errorf("empty whitelist should reject all, got %v", err)
 	}
 }
 
