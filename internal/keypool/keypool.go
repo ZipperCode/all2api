@@ -97,7 +97,7 @@ func New(entries []KeyEntry, opts Options) *Pool {
 
 // maskKey 返回脱敏后的 key：****+尾4位；长度不足返回 ****。
 func maskKey(k string) string {
-	if len(k) < 4 {
+	if len(k) <= 4 {
 		return "****"
 	}
 	return "****" + k[len(k)-4:]
@@ -213,7 +213,7 @@ func (p *Pool) MarkError(label, reason string) {
 	if k := p.findLocked(label); k != nil {
 		k.errorCount++
 		k.lastError = reason
-		if k.errorCount >= p.opts.MaxErrorCount {
+		if p.opts.MaxErrorCount > 0 && k.errorCount >= p.opts.MaxErrorCount {
 			k.status = StatusError
 			k.cooldownUntil = p.now().Add(p.opts.ErrorCooldown)
 		}
@@ -233,6 +233,10 @@ func (p *Pool) MarkKeyInvalid(label, reason string) {
 
 // UpdateFromUpstream 用上游响应额度快照更新 key 状态。
 // 若当日剩余 <= SwitchThreshold，标记为 Exhausted（不影响本次已完成的请求）。
+//
+// 调用契约：仅应在某个 Acquire 返回的 key 收到其对应上游响应后调用，
+// 用该次响应的快照更新自身状态。一次成功响应即视为该 key 工作正常，
+// 因此无条件清零累计错误计数。
 func (p *Pool) UpdateFromUpstream(label string, snap RateLimitSnapshot) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -250,9 +254,7 @@ func (p *Pool) UpdateFromUpstream(label string, snap RateLimitSnapshot) {
 		k.minuteRemaining = snap.MinuteRemaining
 	}
 	k.lastUpdated = now
-	if k.status == StatusError {
-		k.errorCount = 0
-	}
+	k.errorCount = 0 // 成功响应证明 key 正常，无条件清零错误计数
 	k.status = StatusActive
 	if snap.HasDaily && snap.DailyRemaining <= p.opts.SwitchThreshold {
 		k.status = StatusExhausted

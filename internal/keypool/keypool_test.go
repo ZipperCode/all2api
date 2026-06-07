@@ -43,6 +43,10 @@ func TestMaskedKey(t *testing.T) {
 	if maskKey("ab") != "****" {
 		t.Errorf("maskKey short = %q, want ****", maskKey("ab"))
 	}
+	// 边界：长度恰为 4 时不得暴露任何字符
+	if maskKey("abcd") != "****" {
+		t.Errorf("maskKey len==4 = %q, want **** (no chars exposed)", maskKey("abcd"))
+	}
 }
 
 func TestSnapshot_DoesNotLeakFullKey(t *testing.T) {
@@ -171,5 +175,23 @@ func TestMarkError_AccumulatesToThreshold(t *testing.T) {
 	p.MarkError("key-1", "boom")
 	if statusOf(t, p, "key-1") != "error" {
 		t.Errorf("after 3 errors, want error")
+	}
+}
+
+// TestUpdateFromUpstream_ResetsSubThresholdErrorCount 验证一次成功响应清零累计的
+// 错误计数：errorCount=2（未达阈值）时一次成功后，再单次出错不应立即 trip Error。
+func TestUpdateFromUpstream_ResetsSubThresholdErrorCount(t *testing.T) {
+	p := newTestPool(t)
+	p.MarkError("key-1", "e") // errorCount=1, still active
+	p.MarkError("key-1", "e") // errorCount=2, still active
+	if statusOf(t, p, "key-1") != "active" {
+		t.Fatalf("after 2 errors, want active")
+	}
+	// 成功响应应清零 errorCount
+	p.UpdateFromUpstream("key-1", RateLimitSnapshot{HasDaily: true, DailyLimit: 100, DailyRemaining: 50})
+	// 再一次错误：若 errorCount 已清零，仅 1 次不足以 trip Error (MaxErrorCount=3)
+	p.MarkError("key-1", "e")
+	if got := statusOf(t, p, "key-1"); got != "active" {
+		t.Errorf("after success-reset then 1 error, status = %s, want active (errorCount must have reset)", got)
 	}
 }
