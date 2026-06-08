@@ -72,11 +72,23 @@ func TestLoad_ValidConfig(t *testing.T) {
 	if len(cfg.Workspaces) != 2 {
 		t.Errorf("Workspaces count = %d, want 2", len(cfg.Workspaces))
 	}
+	if len(cfg.Platforms) != 2 {
+		t.Errorf("Platforms count = %d, want 2", len(cfg.Platforms))
+	}
 	if cfg.Workspaces["football"].BaseURL != "https://v3.football.api-sports.io" {
 		t.Errorf("football BaseURL = %q", cfg.Workspaces["football"].BaseURL)
 	}
+	if cfg.Platforms["football"].Type != "api_sports" {
+		t.Errorf("football platform type = %q, want api_sports", cfg.Platforms["football"].Type)
+	}
+	if cfg.Platforms["football"].CredentialPool != "default" {
+		t.Errorf("football credential_pool = %q, want default", cfg.Platforms["football"].CredentialPool)
+	}
 	if cfg.Workspaces["basketball"].BaseURL != "https://v1.basketball.api-sports.io" {
 		t.Errorf("basketball BaseURL = %q", cfg.Workspaces["basketball"].BaseURL)
+	}
+	if len(cfg.CredentialPools) != 1 || len(cfg.CredentialPools["default"].Keys) != 2 {
+		t.Errorf("CredentialPools parsed incorrectly: %+v", cfg.CredentialPools)
 	}
 	if cfg.Scheduler.SwitchThreshold != 1 {
 		t.Errorf("SwitchThreshold = %d, want 1", cfg.Scheduler.SwitchThreshold)
@@ -93,6 +105,8 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	p := writeTempConfig(t, validYAML)
 	t.Setenv("GW_SERVER_PORT", "9090")
 	t.Setenv("GW_KEY_KEY_1", "env-secret-1")
+	t.Setenv("GW_ADMIN_KEY", "env-admin")
+	t.Setenv("GW_LOG_FILE", "env-gateway.jsonl")
 
 	cfg, err := Load(p)
 	if err != nil {
@@ -107,6 +121,12 @@ func TestLoad_EnvOverrides(t *testing.T) {
 	if cfg.Keys[1].Key != "real-2" {
 		t.Errorf("Keys[1].Key = %q, want real-2 (unchanged)", cfg.Keys[1].Key)
 	}
+	if cfg.Management.AdminKey != "env-admin" {
+		t.Errorf("Management.AdminKey = %q, want env-admin", cfg.Management.AdminKey)
+	}
+	if cfg.Management.LogFile != "env-gateway.jsonl" {
+		t.Errorf("Management.LogFile = %q, want env-gateway.jsonl", cfg.Management.LogFile)
+	}
 }
 
 func TestValidate_Errors(t *testing.T) {
@@ -115,11 +135,11 @@ func TestValidate_Errors(t *testing.T) {
 		mutate  func(*Config)
 		wantErr string
 	}{
-		{"no keys", func(c *Config) { c.Keys = nil }, "at least one key"},
+		{"no keys", func(c *Config) { c.Keys = nil }, "at least one credential pool"},
 		{"empty key value", func(c *Config) { c.Keys[0].Key = "" }, "empty key"},
 		{"bad port", func(c *Config) { c.Server.Port = 0 }, "server.port"},
 		{"empty workspace base_url", func(c *Config) { c.Workspaces["football"] = WorkspaceConfig{BaseURL: ""} }, "empty base_url"},
-		{"no workspaces", func(c *Config) { c.Workspaces = nil }, "at least one workspace"},
+		{"no workspaces", func(c *Config) { c.Workspaces = nil }, "at least one platform"},
 		{"workspace name with slash", func(c *Config) { c.Workspaces["a/b"] = WorkspaceConfig{BaseURL: "https://x"} }, "must not contain"},
 	}
 	for _, tc := range cases {
@@ -134,6 +154,47 @@ func TestValidate_Errors(t *testing.T) {
 				t.Errorf("validate() error = %q, want substring %q", err.Error(), tc.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoad_GenericPlatformConfig(t *testing.T) {
+	content := `
+server:
+  port: 8080
+platforms:
+  weather:
+    type: generic_http
+    base_url: "https://weather.example.test"
+    timeout_seconds: 10
+    credential_pool: weather-pool
+    auth:
+      header: Authorization
+      prefix: Bearer
+    rate_limit:
+      daily_limit_header: X-Daily-Limit
+      daily_remaining_header: X-Daily-Remaining
+credential_pools:
+  weather-pool:
+    keys:
+      - label: primary
+        key: weather-secret
+`
+	p := writeTempConfig(t, content)
+	t.Setenv("GW_KEY_WEATHER_POOL_PRIMARY", "env-weather-secret")
+
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	platform := cfg.Platforms["weather"]
+	if platform.Type != "generic_http" {
+		t.Errorf("platform.Type = %q, want generic_http", platform.Type)
+	}
+	if platform.Auth.Header != "Authorization" || platform.Auth.Prefix != "Bearer" {
+		t.Errorf("platform.Auth = %+v, want Authorization/Bearer", platform.Auth)
+	}
+	if cfg.CredentialPools["weather-pool"].Keys[0].Key != "env-weather-secret" {
+		t.Errorf("env override key = %q, want env-weather-secret", cfg.CredentialPools["weather-pool"].Keys[0].Key)
 	}
 }
 
@@ -179,6 +240,12 @@ keys:
 	}
 	if cfg.Logging.Level != "info" {
 		t.Errorf("Logging.Level default = %q, want info", cfg.Logging.Level)
+	}
+	if cfg.Management.LogFile != "logs/gateway.jsonl" {
+		t.Errorf("Management.LogFile default = %q, want logs/gateway.jsonl", cfg.Management.LogFile)
+	}
+	if cfg.Management.LogReadLimit != 500 {
+		t.Errorf("Management.LogReadLimit default = %d, want 500", cfg.Management.LogReadLimit)
 	}
 	if cfg.Keys[0].Label != "key-1" {
 		t.Errorf("empty label default = %q, want key-1", cfg.Keys[0].Label)

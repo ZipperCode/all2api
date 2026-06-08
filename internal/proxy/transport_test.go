@@ -5,6 +5,8 @@ import (
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"all2api/internal/provider"
 )
 
 func TestClassifyOutcome(t *testing.T) {
@@ -41,7 +43,7 @@ func TestDoUpstream_InjectsKeyAndStripsAuthorization(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tr := newTransport(srv.URL, 5*time.Second)
+	tr := newTransport(srv.URL, 5*time.Second, mustAPISportsProvider())
 
 	clientReq, _ := http.NewRequest(http.MethodGet, "http://gateway/fixtures?live=all", nil)
 	clientReq.Header.Set("Authorization", "Bearer client-token")
@@ -76,7 +78,7 @@ func TestDoUpstream_PreservesQueryAndPath(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tr := newTransport(srv.URL, 5*time.Second)
+	tr := newTransport(srv.URL, 5*time.Second, mustAPISportsProvider())
 	clientReq, _ := http.NewRequest(http.MethodGet, "http://gateway/players?team=33&season=2024", nil)
 	res := tr.do(clientReq, "k")
 	if res.err != nil {
@@ -87,5 +89,43 @@ func TestDoUpstream_PreservesQueryAndPath(t *testing.T) {
 	}
 	if gotQuery != "team=33&season=2024" {
 		t.Errorf("query = %q, want team=33&season=2024", gotQuery)
+	}
+}
+
+func TestDoUpstream_GenericHeaderProvider(t *testing.T) {
+	var gotAuth string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.Header().Set("X-Daily-Limit", "50")
+		w.Header().Set("X-Daily-Remaining", "49")
+		w.WriteHeader(200)
+	}))
+	defer srv.Close()
+
+	p, err := provider.New(provider.Config{
+		Type: provider.TypeGenericHTTP,
+		Auth: provider.HeaderAuthConfig{Header: "Authorization", Prefix: "Bearer"},
+		RateLimit: provider.RateLimitConfig{
+			DailyLimitHeader:     "X-Daily-Limit",
+			DailyRemainingHeader: "X-Daily-Remaining",
+		},
+	})
+	if err != nil {
+		t.Fatalf("provider.New: %v", err)
+	}
+	tr := newTransport(srv.URL, 5*time.Second, p)
+
+	clientReq, _ := http.NewRequest(http.MethodGet, "http://gateway/forecast", nil)
+	clientReq.Header.Set("Authorization", "Bearer downstream-token")
+	res := tr.do(clientReq, "upstream-secret")
+
+	if res.err != nil {
+		t.Fatalf("do err: %v", res.err)
+	}
+	if gotAuth != "Bearer upstream-secret" {
+		t.Errorf("upstream Authorization = %q, want Bearer upstream-secret", gotAuth)
+	}
+	if !res.snapshot.HasDaily || res.snapshot.DailyRemaining != 49 {
+		t.Errorf("snapshot = %+v, want daily remaining 49", res.snapshot)
 	}
 }

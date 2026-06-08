@@ -1,0 +1,10 @@
+.git
+.codex
+.serena
+bin
+gateway
+logs
+config.yaml
+*.out
+coverage.html
+tmp

@@ -10,8 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"api-football-gateway/internal/auth"
-	"api-football-gateway/internal/keypool"
+	"all2api/internal/auth"
+	"all2api/internal/keypool"
+	"all2api/internal/provider"
 )
 
 func newTestPool() *keypool.Pool {
@@ -26,7 +27,7 @@ func newTestPool() *keypool.Pool {
 	})
 }
 
-// newTestHandler 把上游注册为名为 "test" 的 workspace。
+// newTestHandler 把上游注册为名为 "test" 的 legacy workspace/platform。
 // 测试请求路径需带 /test 前缀（如 /test/fixtures）。
 func newTestHandler(t *testing.T, upstreamURL string, pool *keypool.Pool) *Handler {
 	t.Helper()
@@ -78,7 +79,7 @@ func TestServeHTTP_SuccessForwards(t *testing.T) {
 	}
 }
 
-// TestServeHTTP_UnknownWorkspace404 验证未知 workspace 前缀返回 404。
+// TestServeHTTP_UnknownWorkspace404 验证未知 platform 前缀返回 404。
 func TestServeHTTP_UnknownWorkspace404(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -91,18 +92,18 @@ func TestServeHTTP_UnknownWorkspace404(t *testing.T) {
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/basketball/games", nil))
 
 	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404 for unknown workspace", rec.Code)
+		t.Errorf("status = %d, want 404 for unknown platform", rec.Code)
 	}
 	var body errorResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal 404 body: %v", err)
 	}
-	if body.Error != "unknown_workspace" {
-		t.Errorf("error = %q, want unknown_workspace", body.Error)
+	if body.Error != "unknown_platform" {
+		t.Errorf("error = %q, want unknown_platform", body.Error)
 	}
 }
 
-// TestServeHTTP_MultiWorkspaceRouting 验证不同 workspace 前缀路由到各自上游。
+// TestServeHTTP_MultiWorkspaceRouting 验证不同 legacy workspace/platform 前缀路由到各自上游。
 func TestServeHTTP_MultiWorkspaceRouting(t *testing.T) {
 	footballSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -375,7 +376,85 @@ func TestServeHTTP_ClientDisconnectDoesNotMarkKeyError(t *testing.T) {
 	}
 }
 
-func TestSplitWorkspace(t *testing.T) {
+func TestServeHTTP_GenericPlatformUsesOwnProviderAndPool(t *testing.T) {
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("generic-ok:" + r.URL.Path))
+	}))
+	defer upstream.Close()
+
+	genericProvider, err := provider.New(provider.Config{
+		Type: provider.TypeGenericHTTP,
+		Auth: provider.HeaderAuthConfig{Header: "Authorization", Prefix: "Bearer"},
+	})
+	if err != nil {
+		t.Fatalf("provider.New: %v", err)
+	}
+	pool := keypool.New([]keypool.KeyEntry{{Label: "generic-key", Key: "generic-secret"}}, keypool.Options{
+		SwitchThreshold:   1,
+		RateLimitCooldown: time.Minute,
+		ErrorCooldown:     time.Minute,
+		MaxErrorCount:     3,
+	})
+	h := NewHandler(Config{
+		Platforms: map[string]PlatformUpstream{
+			"weather": {
+				BaseURL:  upstream.URL,
+				Timeout:  5 * time.Second,
+				Provider: genericProvider,
+				Pool:     pool,
+				PoolName: "weather-pool",
+			},
+		},
+		MaxRetries: 1,
+	}, nil, auth.New(false, nil))
+
+	req := httptest.NewRequest(http.MethodGet, "/weather/forecast", nil)
+	req.Header.Set("Authorization", "Bearer downstream")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != 200 {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec.Body.String() != "generic-ok:/forecast" {
+		t.Errorf("body = %q, want generic-ok:/forecast", rec.Body.String())
+	}
+	if gotAuth != "Bearer generic-secret" {
+		t.Errorf("upstream Authorization = %q, want Bearer generic-secret", gotAuth)
+	}
+}
+
+func TestServeHTTP_PlatformWithoutPoolReturns500(t *testing.T) {
+	h := NewHandler(Config{
+		Platforms: map[string]PlatformUpstream{
+			"broken": {
+				BaseURL:  "http://127.0.0.1:1",
+				Timeout:  time.Second,
+				Provider: mustAPISportsProvider(),
+			},
+		},
+		MaxRetries: 1,
+	}, nil, auth.New(false, nil))
+
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/broken/x", nil))
+
+	if rec.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500", rec.Code)
+	}
+	var body errorResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.Error != "platform_misconfigured" {
+		t.Errorf("error = %q, want platform_misconfigured", body.Error)
+	}
+}
+
+func TestSplitPlatform(t *testing.T) {
 	cases := []struct {
 		path    string
 		wantWS  string
@@ -389,9 +468,9 @@ func TestSplitWorkspace(t *testing.T) {
 		{"/basketball/games", "basketball", "/games"},
 	}
 	for _, c := range cases {
-		gotWS, gotRst := splitWorkspace(c.path)
+		gotWS, gotRst := splitPlatform(c.path)
 		if gotWS != c.wantWS || gotRst != c.wantRst {
-			t.Errorf("splitWorkspace(%q) = (%q, %q), want (%q, %q)",
+			t.Errorf("splitPlatform(%q) = (%q, %q), want (%q, %q)",
 				c.path, gotWS, gotRst, c.wantWS, c.wantRst)
 		}
 	}

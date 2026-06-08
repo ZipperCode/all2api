@@ -2,18 +2,45 @@ server:
   host: "0.0.0.0"
   port: 8080
 
-# workspaces：下游请求路径 /<workspace>/<原路径> 按 workspace 选上游。
-# 一套 key 池被所有 workspace 共享（API-Sports 同 key 可访问多个体育子站）。
-workspaces:
+# platforms：下游请求路径 /<platform>/<原路径> 按 platform 选上游。
+# 每个 platform 绑定一个 provider 类型和一个 credential_pool。
+platforms:
   football:
+    type: "api_sports"
     base_url: "https://v3.football.api-sports.io"
     timeout_seconds: 30
+    credential_pool: "api-sports"
   basketball:
+    type: "api_sports"
     base_url: "https://v1.basketball.api-sports.io"
     timeout_seconds: 30
-  baseball:
-    base_url: "https://v1.baseball.api-sports.io"
+    credential_pool: "api-sports"
+
+  # 通用 Header 凭证平台：适合 X-API-Key、Authorization: Bearer 等纯转发 API。
+  weather:
+    type: "generic_http"
+    base_url: "https://api.weather.example"
     timeout_seconds: 30
+    credential_pool: "weather"
+    auth:
+      header: "Authorization"
+      prefix: "Bearer"
+    # 可选：如果上游有额度 header，可配置后进入 /__gateway/status。
+    rate_limit:
+      daily_limit_header: "X-Daily-Limit"
+      daily_remaining_header: "X-Daily-Remaining"
+
+credential_pools:
+  api-sports:
+    keys:
+      - label: "key-1"
+        key: "your_real_api_sports_key_1"
+      - label: "key-2"
+        key: "your_real_api_sports_key_2"
+  weather:
+    keys:
+      - label: "primary"
+        key: "your_weather_api_key"
 
 scheduler:
   switch_threshold: 1
@@ -22,11 +49,11 @@ scheduler:
   max_error_count: 3
   max_retries: 3
 
-keys:
-  - label: "key-1"
-    key: "your_real_api_key_1"
-  - label: "key-2"
-    key: "your_real_api_key_2"
+management:
+  # 管理后台登录 key；也可用 GW_ADMIN_KEY 覆盖。
+  admin_key: "change-this-admin-key"
+  log_file: "logs/gateway.jsonl"
+  log_read_limit: 500
 
 client_auth:
   enabled: false

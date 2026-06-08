@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>all2api Admin</title>
+    <link rel="icon" href="data:," />
+    <link rel="stylesheet" href="/__admin/styles.css" />
+  </head>
+  <body>
+    <section id="login" class="login-view">
+      <main class="login-panel" aria-labelledby="login-title">
+        <div class="brand-block" aria-hidden="true">
+          <div class="brand-mark">all2api</div>
+          <div class="brand-product">API Gateway Admin</div>
+        </div>
+        <div class="login-card">
+          <p class="eyebrow">Management</p>
+          <h1 id="login-title">登录管理后台</h1>
+          <form id="login-form" class="login-form">
+            <label class="field">
+              <span>Admin Key</span>
+              <input id="admin-key" type="password" autocomplete="current-password" required />
+            </label>
+            <button class="button primary full" type="submit">登录</button>
+            <p id="login-error" class="form-error" role="alert"></p>
+          </form>
+        </div>
+      </main>
+    </section>
+
+    <div id="app" class="app-shell hidden">
+      <aside class="side-nav" aria-label="后台导航">
+        <div class="side-brand">
+          <div class="brand-mark">all2api</div>
+          <div class="brand-product">Gateway Admin</div>
+        </div>
+        <nav class="nav-tabs" role="tablist" aria-label="Admin sections">
+          <button class="nav-tab active" data-view="dashboard" type="button">控制台</button>
+          <button class="nav-tab" data-view="platforms" type="button">平台</button>
+          <button class="nav-tab" data-view="keys" type="button">密钥池</button>
+          <button class="nav-tab" data-view="logs" type="button">日志</button>
+          <button class="nav-tab" data-view="docs" type="button">文档</button>
+        </nav>
+      </aside>
+
+      <main class="workspace">
+        <header class="topbar">
+          <div>
+            <p id="view-kicker" class="eyebrow">Runtime</p>
+            <h2 id="view-title">控制台</h2>
+          </div>
+          <div class="top-actions">
+            <span id="save-state" class="save-state" aria-live="polite"></span>
+            <button id="refresh" class="button secondary" type="button">刷新</button>
+            <button id="save-config" class="button primary hidden" type="button">保存配置</button>
+            <button id="logout" class="button ghost" type="button">退出</button>
+          </div>
+        </header>
+
+        <div class="content-shell">
+          <section id="dashboard-view" class="view active"></section>
+          <section id="platforms-view" class="view"></section>
+          <section id="keys-view" class="view"></section>
+          <section id="logs-view" class="view"></section>
+          <section id="docs-view" class="view"></section>
+        </div>
+      </main>
+    </div>
+
+    <template id="empty-template">
+      <div class="empty-state">暂无数据</div>
+    </template>
+
+    <script src="/__admin/app.js"></script>
+  </body>
+</html>

@@ -1,4 +1,4 @@
-// Command gateway 启动 API-Football 多 key 请求网关。
+// Command gateway starts the generic multi-upstream API gateway.
 package main
 
 import (
@@ -13,11 +13,10 @@ import (
 	"syscall"
 	"time"
 
-	"api-football-gateway/internal/admin"
-	"api-football-gateway/internal/auth"
-	"api-football-gateway/internal/config"
-	"api-football-gateway/internal/keypool"
-	"api-football-gateway/internal/proxy"
+	"all2api/internal/admin"
+	"all2api/internal/config"
+	"all2api/internal/gateway"
+	"all2api/internal/logstore"
 )
 
 func main() {
@@ -33,36 +32,23 @@ func main() {
 	logger := newLogger(cfg.Logging.Level)
 	slog.SetDefault(logger)
 
-	entries := make([]keypool.KeyEntry, 0, len(cfg.Keys))
-	for _, k := range cfg.Keys {
-		entries = append(entries, keypool.KeyEntry{Label: k.Label, Key: k.Key})
+	events, err := logstore.New(cfg.Management.LogFile)
+	if err != nil {
+		logger.Error("failed to initialize log store", "error", err)
+		os.Exit(1)
 	}
-	pool := keypool.New(entries, keypool.Options{
-		SwitchThreshold:   cfg.Scheduler.SwitchThreshold,
-		RateLimitCooldown: time.Duration(cfg.Scheduler.RateLimitCooldownSeconds) * time.Second,
-		ErrorCooldown:     time.Duration(cfg.Scheduler.ErrorCooldownSeconds) * time.Second,
-		MaxErrorCount:     cfg.Scheduler.MaxErrorCount,
-	})
-
-	authenticator := auth.New(cfg.ClientAuth.Enabled, cfg.ClientAuth.Tokens)
-
-	workspaces := make(map[string]proxy.WorkspaceUpstream, len(cfg.Workspaces))
-	for name, ws := range cfg.Workspaces {
-		workspaces[name] = proxy.WorkspaceUpstream{
-			BaseURL: ws.BaseURL,
-			Timeout: time.Duration(ws.TimeoutSeconds) * time.Second,
-		}
+	manager, err := gateway.New(*configPath, cfg, logger, events)
+	if err != nil {
+		logger.Error("failed to initialize gateway runtime", "error", err)
+		os.Exit(1)
 	}
-	proxyHandler := proxy.NewHandler(proxy.Config{
-		Workspaces: workspaces,
-		MaxRetries: cfg.Scheduler.MaxRetries,
-	}, pool, authenticator).WithLogger(logger)
-
-	adminHandler := admin.New(pool)
+	adminHandler := admin.NewConsole(manager, events)
 
 	mux := http.NewServeMux()
+	mux.Handle("/__admin/", adminHandler)
+	mux.Handle("/__admin", adminHandler)
 	mux.Handle("/__gateway/", adminHandler)
-	mux.Handle("/", proxyHandler)
+	mux.Handle("/", manager)
 
 	addr := cfg.Server.Host + ":" + strconv.Itoa(cfg.Server.Port)
 	srv := &http.Server{
@@ -71,16 +57,16 @@ func main() {
 		ReadHeaderTimeout: 10 * time.Second, // 防慢连接长期占用 goroutine
 	}
 
-	wsNames := make([]string, 0, len(cfg.Workspaces))
-	for name := range cfg.Workspaces {
-		wsNames = append(wsNames, name)
+	platformNames := make([]string, 0, len(cfg.Platforms))
+	for name := range cfg.Platforms {
+		platformNames = append(platformNames, name)
 	}
 
 	go func() {
 		logger.Info("gateway listening",
 			"addr", addr,
-			"workspaces", strings.Join(wsNames, ","),
-			"keys", len(cfg.Keys),
+			"platforms", strings.Join(platformNames, ","),
+			"credential_pools", len(cfg.CredentialPools),
 			"client_auth", cfg.ClientAuth.Enabled)
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			logger.Error("server error", "error", err)

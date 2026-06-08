@@ -10,18 +10,20 @@ import (
 	"strings"
 	"time"
 
-	"api-football-gateway/internal/auth"
-	"api-football-gateway/internal/keypool"
+	"all2api/internal/auth"
+	"all2api/internal/keypool"
+	"all2api/internal/logstore"
+	"all2api/internal/provider"
 )
 
-// splitWorkspace 从请求路径中分离 workspace 前缀与剩余路径。
+// splitPlatform separates the public platform prefix from the upstream path.
 //
 //	"/football/fixtures?..." → ("football", "/fixtures")
 //	"/football"              → ("football", "/")
 //	"/"  或  ""              → ("", "/")
 //
 // 剩余路径总是以 "/" 开头，便于直接拼接上游 base_url。
-func splitWorkspace(path string) (workspace, rest string) {
+func splitPlatform(path string) (platform, rest string) {
 	trimmed := strings.TrimPrefix(path, "/")
 	if trimmed == "" {
 		return "", "/"
@@ -38,41 +40,107 @@ type WorkspaceUpstream struct {
 	Timeout time.Duration
 }
 
+// PlatformUpstream describes one public platform prefix.
+type PlatformUpstream struct {
+	BaseURL  string
+	Timeout  time.Duration
+	Provider provider.Provider
+	Pool     *keypool.Pool
+	PoolName string
+}
+
 // Config 配置中转 handler。
 type Config struct {
-	// Workspaces 是 workspace 名 → 上游连接参数的映射。
-	// 下游请求路径形如 /<workspace>/<rest>，按 workspace 选对应上游。
+	// Platforms maps /<platform>/<rest> to its upstream runtime.
+	Platforms map[string]PlatformUpstream
+
+	// Workspaces is the legacy API-Sports-only runtime config.
 	Workspaces map[string]WorkspaceUpstream
 	MaxRetries int
 }
 
-// Handler 是网关的核心中转处理器。
-type Handler struct {
-	pool       *keypool.Pool
-	auth       *auth.Authenticator
-	transports map[string]*transport // workspace 名 → 预构建的 transport
-	maxRetries int
-	logger     *slog.Logger
+type platformRuntime struct {
+	transport *transport
+	pool      *keypool.Pool
+	poolName  string
 }
 
-// NewHandler 构造中转 handler，为每个 workspace 预构建一个 transport（复用连接池）。
-func NewHandler(cfg Config, pool *keypool.Pool, a *auth.Authenticator) *Handler {
+// Handler 是网关的核心中转处理器。
+type Handler struct {
+	auth       *auth.Authenticator
+	platforms  map[string]platformRuntime
+	maxRetries int
+	logger     *slog.Logger
+	eventSink  EventSink
+}
+
+// EventSink records proxy events.
+type EventSink interface {
+	Record(logstore.Event)
+}
+
+// NewHandler 构造中转 handler，为每个 platform 预构建一个 transport（复用连接池）。
+func NewHandler(cfg Config, defaultPool *keypool.Pool, a *auth.Authenticator) *Handler {
 	maxRetries := cfg.MaxRetries
 	if maxRetries < 1 {
 		// 防御误配：MaxRetries<1 会导致每个请求直接 503。至少尝试一次。
 		maxRetries = 1
 	}
-	transports := make(map[string]*transport, len(cfg.Workspaces))
-	for name, ws := range cfg.Workspaces {
-		transports[name] = newTransport(ws.BaseURL, ws.Timeout)
+	platforms := normalizePlatforms(cfg, defaultPool)
+	runtimes := make(map[string]platformRuntime, len(platforms))
+	for name, upstream := range platforms {
+		runtimes[name] = platformRuntime{
+			transport: newTransport(upstream.BaseURL, upstream.Timeout, upstream.Provider),
+			pool:      upstream.Pool,
+			poolName:  upstream.PoolName,
+		}
 	}
 	return &Handler{
-		pool:       pool,
 		auth:       a,
-		transports: transports,
+		platforms:  runtimes,
 		maxRetries: maxRetries,
 		logger:     slog.Default(),
 	}
+}
+
+func normalizePlatforms(cfg Config, defaultPool *keypool.Pool) map[string]PlatformUpstream {
+	if len(cfg.Platforms) > 0 {
+		out := make(map[string]PlatformUpstream, len(cfg.Platforms))
+		for name, upstream := range cfg.Platforms {
+			if upstream.Pool == nil {
+				upstream.Pool = defaultPool
+			}
+			if upstream.PoolName == "" {
+				upstream.PoolName = "default"
+			}
+			if upstream.Provider == nil {
+				upstream.Provider = mustAPISportsProvider()
+			}
+			out[name] = upstream
+		}
+		return out
+	}
+
+	out := make(map[string]PlatformUpstream, len(cfg.Workspaces))
+	apiSports := mustAPISportsProvider()
+	for name, ws := range cfg.Workspaces {
+		out[name] = PlatformUpstream{
+			BaseURL:  ws.BaseURL,
+			Timeout:  ws.Timeout,
+			Provider: apiSports,
+			Pool:     defaultPool,
+			PoolName: "default",
+		}
+	}
+	return out
+}
+
+func mustAPISportsProvider() provider.Provider {
+	p, err := provider.New(provider.Config{Type: provider.TypeAPISports})
+	if err != nil {
+		panic(err)
+	}
+	return p
 }
 
 // WithLogger 注入自定义 logger。
@@ -81,19 +149,62 @@ func (h *Handler) WithLogger(l *slog.Logger) *Handler {
 	return h
 }
 
-// ServeHTTP 执行中转管线：认证 → 解析 workspace → 缓冲请求体 → 换 key 重试 → 回传。
+// WithEventSink injects a structured event sink.
+func (h *Handler) WithEventSink(sink EventSink) *Handler {
+	h.eventSink = sink
+	return h
+}
+
+// ServeHTTP 执行中转管线：认证 → 解析 platform → 缓冲请求体 → 换 key 重试 → 回传。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	start := time.Now()
+	originalPath := r.URL.Path
 	if err := h.auth.Authorize(r); err != nil {
 		writeJSONError(w, http.StatusUnauthorized, "unauthorized", "client authorization failed", nil, 0)
+		h.recordProxyEvent(logstore.Event{
+			Level:      "warn",
+			Message:    "client authorization failed",
+			Method:     r.Method,
+			Path:       originalPath,
+			StatusCode: http.StatusUnauthorized,
+			DurationMS: time.Since(start).Milliseconds(),
+			Error:      err.Error(),
+			RemoteAddr: r.RemoteAddr,
+		})
 		return
 	}
 
-	// 解析路径前缀 /<workspace>/<rest>，选定对应上游 transport，并把剩余路径设回请求。
-	workspace, rest := splitWorkspace(r.URL.Path)
-	tr, ok := h.transports[workspace]
+	// 解析路径前缀 /<platform>/<rest>，选定对应上游 runtime，并把剩余路径设回请求。
+	platform, rest := splitPlatform(r.URL.Path)
+	runtime, ok := h.platforms[platform]
 	if !ok {
-		writeJSONError(w, http.StatusNotFound, "unknown_workspace",
-			"unknown workspace in path; expected /<workspace>/<path>", nil, 0)
+		writeJSONError(w, http.StatusNotFound, "unknown_platform",
+			"unknown platform in path; expected /<platform>/<path>", nil, 0)
+		h.recordProxyEvent(logstore.Event{
+			Level:      "warn",
+			Message:    "unknown platform",
+			Platform:   platform,
+			Method:     r.Method,
+			Path:       originalPath,
+			StatusCode: http.StatusNotFound,
+			DurationMS: time.Since(start).Milliseconds(),
+			RemoteAddr: r.RemoteAddr,
+		})
+		return
+	}
+	if runtime.pool == nil {
+		writeJSONError(w, http.StatusInternalServerError, "platform_misconfigured",
+			"platform has no credential pool", nil, 0)
+		h.recordProxyEvent(logstore.Event{
+			Level:      "error",
+			Message:    "platform has no credential pool",
+			Platform:   platform,
+			Method:     r.Method,
+			Path:       originalPath,
+			StatusCode: http.StatusInternalServerError,
+			DurationMS: time.Since(start).Milliseconds(),
+			RemoteAddr: r.RemoteAddr,
+		})
 		return
 	}
 	r.URL.Path = rest
@@ -103,6 +214,17 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		b, err := io.ReadAll(r.Body)
 		if err != nil {
 			writeJSONError(w, http.StatusBadRequest, "bad_request", "failed to read request body", nil, 0)
+			h.recordProxyEvent(logstore.Event{
+				Level:      "warn",
+				Message:    "failed to read request body",
+				Platform:   platform,
+				Method:     r.Method,
+				Path:       originalPath,
+				StatusCode: http.StatusBadRequest,
+				DurationMS: time.Since(start).Milliseconds(),
+				Error:      err.Error(),
+				RemoteAddr: r.RemoteAddr,
+			})
 			return
 		}
 		bodyBytes = b
@@ -111,7 +233,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	attempts := 0
 	for attempts < h.maxRetries {
-		handle, err := h.pool.Acquire()
+		handle, err := runtime.pool.Acquire()
 		if err != nil {
 			break
 		}
@@ -124,57 +246,118 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			attemptReq.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 		}
 
-		res := tr.do(attemptReq, handle.Key())
+		res := runtime.transport.do(attemptReq, handle.Key())
 
 		switch res.kind {
 		case outcomeSuccess:
-			justExhausted := h.pool.UpdateFromUpstream(handle.Label(), res.snapshot)
+			justExhausted := runtime.pool.UpdateFromUpstream(handle.Label(), res.snapshot)
 			// 若本次成功后该 key 当日额度恰好耗尽，记 INFO 便于运营感知后续切换。
 			if justExhausted {
 				h.logger.Info("key exhausted after this response, will switch on next request",
-					"key", handle.Label(), "daily_remaining", res.snapshot.DailyRemaining)
+					"platform", platform, "pool", runtime.poolName, "key", handle.Label(),
+					"daily_remaining", res.snapshot.DailyRemaining)
 			}
 			h.writeUpstreamResponse(w, res)
+			h.recordProxyEvent(logstore.Event{
+				Level:      "info",
+				Message:    "proxy request completed",
+				Platform:   platform,
+				Pool:       runtime.poolName,
+				KeyLabel:   handle.Label(),
+				Method:     r.Method,
+				Path:       originalPath,
+				StatusCode: res.statusCode,
+				DurationMS: time.Since(start).Milliseconds(),
+				Attempts:   attempts,
+				RemoteAddr: r.RemoteAddr,
+			})
 			return
 
 		case outcomeRateLimited:
-			h.pool.MarkRateLimited(handle.Label())
+			runtime.pool.MarkRateLimited(handle.Label())
 			h.logger.Warn("key rate limited, switching",
-				"key", handle.Label(), "attempt", attempts)
+				"platform", platform, "pool", runtime.poolName, "key", handle.Label(), "attempt", attempts)
 			continue
 
 		case outcomeKeyInvalid:
-			h.pool.MarkKeyInvalid(handle.Label(), "upstream returned "+strconv.Itoa(res.statusCode))
+			runtime.pool.MarkKeyInvalid(handle.Label(), "upstream returned "+strconv.Itoa(res.statusCode))
 			h.logger.Error("key invalid (401/403), switching",
-				"key", handle.Label(), "status", res.statusCode)
+				"platform", platform, "pool", runtime.poolName, "key", handle.Label(), "status", res.statusCode)
 			continue
 
 		case outcomeServerError:
 			// 客户端断连导致的 context 取消不计为 key 错误，且重试无意义（无人接收响应）。
 			if r.Context().Err() != nil {
 				h.logger.Warn("client disconnected, aborting", "key", handle.Label())
+				h.recordProxyEvent(logstore.Event{
+					Level:      "warn",
+					Message:    "client disconnected",
+					Platform:   platform,
+					Pool:       runtime.poolName,
+					KeyLabel:   handle.Label(),
+					Method:     r.Method,
+					Path:       originalPath,
+					DurationMS: time.Since(start).Milliseconds(),
+					Attempts:   attempts,
+					Error:      r.Context().Err().Error(),
+					RemoteAddr: r.RemoteAddr,
+				})
 				return
 			}
 			reason := "upstream server error"
 			if res.err != nil {
 				reason = res.err.Error()
 			}
-			h.pool.MarkError(handle.Label(), reason)
+			runtime.pool.MarkError(handle.Label(), reason)
 			h.logger.Warn("upstream error, switching",
-				"key", handle.Label(), "reason", reason)
+				"platform", platform, "pool", runtime.poolName, "key", handle.Label(), "reason", reason)
 			continue
 
 		case outcomeClientError:
-			h.pool.UpdateFromUpstream(handle.Label(), res.snapshot)
+			runtime.pool.UpdateFromUpstream(handle.Label(), res.snapshot)
 			h.writeUpstreamResponse(w, res)
+			h.recordProxyEvent(logstore.Event{
+				Level:      "info",
+				Message:    "proxy client error passed through",
+				Platform:   platform,
+				Pool:       runtime.poolName,
+				KeyLabel:   handle.Label(),
+				Method:     r.Method,
+				Path:       originalPath,
+				StatusCode: res.statusCode,
+				DurationMS: time.Since(start).Milliseconds(),
+				Attempts:   attempts,
+				RemoteAddr: r.RemoteAddr,
+			})
 			return
 		}
 	}
 
-	retryAfter := h.pool.EarliestRecoverySeconds()
-	h.logger.Error("all keys unavailable", "retry_after_seconds", retryAfter)
+	retryAfter := runtime.pool.EarliestRecoverySeconds()
+	h.logger.Error("all keys unavailable", "platform", platform, "pool", runtime.poolName,
+		"retry_after_seconds", retryAfter)
 	writeJSONError(w, http.StatusServiceUnavailable, "all_keys_unavailable",
-		"All upstream API keys are exhausted or rate-limited", h.pool.Snapshot(), retryAfter)
+		"All upstream API keys are exhausted or rate-limited", runtime.pool.Snapshot(), retryAfter)
+	h.recordProxyEvent(logstore.Event{
+		Level:      "error",
+		Message:    "all keys unavailable",
+		Platform:   platform,
+		Pool:       runtime.poolName,
+		Method:     r.Method,
+		Path:       originalPath,
+		StatusCode: http.StatusServiceUnavailable,
+		DurationMS: time.Since(start).Milliseconds(),
+		Attempts:   attempts,
+		RemoteAddr: r.RemoteAddr,
+	})
+}
+
+func (h *Handler) recordProxyEvent(e logstore.Event) {
+	if h.eventSink == nil {
+		return
+	}
+	e.Kind = "proxy"
+	h.eventSink.Record(e)
 }
 
 // writeUpstreamResponse 把上游响应原样回传给下游（白名单响应头 + 状态码 + body）。

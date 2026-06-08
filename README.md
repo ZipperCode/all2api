@@ -1,134 +1,237 @@
-# API-Football Gateway
+# all2api Gateway
 
-局域网内的 API-Sports 多 key 请求网关。对客户端屏蔽真实密钥，在多个 key 间**顺序耗尽式轮换**，通过 **workspace 前缀**把一套 key 路由到多个体育 API 子站，实时监控各 key 当日额度，上游错误时**自动换 key 重试且对下游透明**。
+局域网内的通用 API 转发平台。对客户端屏蔽真实上游凭证，按 `/<platform>/<原路径>` 路由到不同上游，并在命名 `credential_pools` 中做多 key 顺序耗尽、自动重试和状态监控。
+
+第一版是**纯转发 MVP**：不做请求/响应协议转换，只做路由、客户端认证、上游凭证注入、限额解析、错误分类和换 key 重试。
 
 ## 特性
 
-- **多 key 顺序耗尽**：固定用 key-1 直到当日额度耗尽，再自动切到 key-2……把多个 key 当成一个大额度池。
-- **多 workspace 路由**：下游请求路径 `/<workspace>/<原路径>` 按 workspace 选上游（football/basketball/baseball...），一套 key 池被所有 workspace 共享。
-- **下游零改造迁移**：下游只需把 baseUrl 改成 `http://<网关>/<workspace>`，**原路径格式与认证方式都不变**。
-- **双认证位**：客户端凭证可放 `Authorization: Bearer <token>` **或** `x-apisports-key: <token>`（与上游同名头，下游沿用原有写法即可）。初版不校验，预留启用钩子。
-- **下游无感知**：上游返回 429 / 额度耗尽 / 401 / 403 / 5xx / 网络错误时，网关内部静默换 key 重试，客户端只看到最终成功响应或全部失败的 503。
-- **实时额度监控**：额度数据完全来自上游响应 header（`x-ratelimit-*`），网关不自行计数，重启自愈。
-- **凭证隔离**：客户端凭证与上游真实 `x-apisports-key` 彻底分离。
-- **内存状态**：无数据库依赖，单二进制部署。
+- **多 platform 路由**：`/<platform>/<path>` 选择上游平台，路径前缀会被剥离后转发。
+- **命名凭证池**：多个 platform 可以共享同一个 `credential_pool`，也可以各自独立。
+- **平台 provider**：
+  - `api_sports`：注入 `x-apisports-key`，解析 API-Sports 额度 header。
+  - `generic_http`：可配置任意 Header 凭证，例如 `X-API-Key` 或 `Authorization: Bearer <key>`。
+- **顺序耗尽式轮换**：固定用 key-1 直到额度耗尽，再切 key-2。
+- **下游无感知重试**：429、401/403、5xx、网络错误会内部换 key 重试；全部失败才返回 503。
+- **凭证隔离**：客户端凭证不会透传到上游，上游真实凭证也不会泄露给客户端。
+- **内存状态**：无数据库依赖，额度来自上游响应 header，重启后由响应自愈。
 
 ## 快速开始
 
-1. 复制并填写配置：
+一键本地运行：
 
-   ```bash
-   cp config.example.yaml config.yaml
-   # 编辑 config.yaml，填入真实 API key
-   ```
+```bash
+./scripts/run.sh
+```
 
-2. 运行：
+首次运行会自动从 `config.example.yaml` 创建 `config.yaml`，生成 `management.admin_key`，并创建 `logs/`。已有 `config.yaml` 不会被覆盖。
 
-   ```bash
-   go run ./cmd/gateway -config config.yaml
-   # 或编译后运行
-   go build -o gateway ./cmd/gateway && ./gateway -config config.yaml
-   ```
+手动运行：
 
-3. 请求端改造：**只改 baseUrl**——加上网关地址和 workspace 前缀，路径格式和认证方式都不变：
+```bash
+cp config.example.yaml config.yaml
+# 编辑 config.yaml，填入真实 key 和 management.admin_key
 
-   ```bash
-   # 原本: https://v3.football.api-sports.io/fixtures?live=all
-   # 改为: http://<网关LAN_IP>:8080/football/fixtures?live=all
-   #                                  ^^^^^^^^ workspace 前缀
+go run ./cmd/gateway -config config.yaml
+# 或
+go build -o gateway ./cmd/gateway && ./gateway -config config.yaml
+```
 
-   # 认证位两种都支持（初版不校验，任意值即可）：
-   curl -H "Authorization: Bearer anything" \
-        "http://<网关LAN_IP>:8080/football/fixtures?live=all"
-   # 或沿用原有的 x-apisports-key 写法（下游零改造）：
-   curl -H "x-apisports-key: anything" \
-        "http://<网关LAN_IP>:8080/football/fixtures?live=all"
-   ```
+管理界面：
 
-   网关会：剥离 workspace 前缀 → 剥离客户端凭证 → 选 key 注入真实 `x-apisports-key` → 转发到该 workspace 对应上游 → 原样回传响应。
+```text
+http://127.0.0.1:8080/__admin/
+```
 
-   不同体育 API 用不同前缀：
+登录只需要输入 `management.admin_key`（或 `GW_ADMIN_KEY`）。
 
-   ```bash
-   http://<网关>/football/fixtures?live=all  → https://v3.football.api-sports.io/fixtures?live=all
-   http://<网关>/basketball/games            → https://v1.basketball.api-sports.io/games
-   ```
+## Docker Compose 部署
+
+一键启动：
+
+```bash
+./scripts/docker-up.sh
+```
+
+手动启动：
+
+```bash
+cp config.example.yaml config.yaml
+# 编辑 config.yaml，填入真实 key 和 management.admin_key
+mkdir -p logs
+docker compose up -d --build
+```
+
+默认映射到宿主机 `8080`：
+
+```text
+http://127.0.0.1:8080/__admin/
+```
+
+常用命令：
+
+```bash
+docker compose logs -f all2api
+docker compose restart all2api
+docker compose down
+```
+
+可用 `ALL2API_PORT` 改宿主机端口：
+
+```bash
+ALL2API_PORT=18080 docker compose up -d --build
+```
+
+请求示例：
+
+```bash
+# API-Sports platform
+curl -H "Authorization: Bearer client-token" \
+  "http://127.0.0.1:8080/football/fixtures?live=all"
+
+# Generic Header platform，配置中会把 weather pool 的 key 注入为 Authorization: Bearer <key>
+curl -H "Authorization: Bearer client-token" \
+  "http://127.0.0.1:8080/weather/forecast?city=shanghai"
+```
+
+网关处理流程：
+
+```text
+/<platform>/<path>
+  -> 校验客户端凭证（可关闭）
+  -> 剥离 platform 前缀
+  -> 按 platform 选择 provider + credential_pool
+  -> 选择可用 key
+  -> provider 注入上游凭证
+  -> 转发到 base_url + /<path>
+  -> 根据 provider 解析额度与错误
+```
 
 ## 配置说明
 
-见 `config.example.yaml`。关键项：
+核心结构见 `config.example.yaml`。
 
 | 配置 | 说明 |
 |------|------|
-| `server.host` / `server.port` | 监听地址（局域网部署用 `0.0.0.0`） |
-| `workspaces.<名>.base_url` | 该 workspace 对应的上游地址（如 football → `https://v3.football.api-sports.io`） |
-| `workspaces.<名>.timeout_seconds` | 该 workspace 单次上游请求超时（默认 30） |
-| `keys` | 真实 key 列表，按顺序耗尽使用，被所有 workspace 共享 |
-| `scheduler.switch_threshold` | 当日剩余 <= 此值即视为耗尽并切换（默认 1） |
-| `scheduler.rate_limit_cooldown_seconds` | 429 后该 key 退避时长（默认 60） |
-| `scheduler.error_cooldown_seconds` | 连续错误后退避时长（默认 30） |
-| `scheduler.max_error_count` | 连续错误几次进入 Error 冷却（默认 3） |
-| `scheduler.max_retries` | 单请求最多换几次 key（默认 3） |
-| `client_auth.enabled` | 初版 `false`（接受任意 Bearer token） |
-| `logging.level` | `debug` / `info` / `warn` / `error` |
+| `platforms.<name>.type` | `api_sports` 或 `generic_http` |
+| `platforms.<name>.base_url` | 上游基础地址 |
+| `platforms.<name>.credential_pool` | 引用的命名凭证池 |
+| `platforms.<name>.auth.header` | `generic_http` 注入凭证的 Header 名 |
+| `platforms.<name>.auth.prefix` | 可选前缀，如 `Bearer`，最终为 `Bearer <key>` |
+| `credential_pools.<name>.keys` | 真实上游 key 列表 |
+| `scheduler.max_retries` | 单请求最多换 key 尝试次数 |
+| `management.admin_key` | 管理后台登录 key |
+| `management.log_file` | 结构化 JSONL 日志文件 |
+| `management.log_read_limit` | 日志页最大读取条数 |
+| `client_auth.enabled` | 是否校验下游客户端 token |
 
-### 环境变量覆盖
+### API-Sports 共享 key
 
-真实 key 可用环境变量覆盖（避免明文落盘）：
+```yaml
+platforms:
+  football:
+    type: api_sports
+    base_url: "https://v3.football.api-sports.io"
+    credential_pool: api-sports
+  basketball:
+    type: api_sports
+    base_url: "https://v1.basketball.api-sports.io"
+    credential_pool: api-sports
 
-- `GW_SERVER_PORT` 覆盖端口。
-- `GW_KEY_<LABEL>` 覆盖对应 label 的 key（label 大写、非字母数字转下划线）。例如 label `key-1` → `GW_KEY_KEY_1`。
+credential_pools:
+  api-sports:
+    keys:
+      - label: key-1
+        key: real-key-1
+      - label: key-2
+        key: real-key-2
+```
 
-非法的 `GW_SERVER_PORT` 会在启动时报错（fail-fast），不会静默回退。
+### Generic Header API
 
-## 监控
+```yaml
+platforms:
+  weather:
+    type: generic_http
+    base_url: "https://api.weather.example"
+    credential_pool: weather
+    auth:
+      header: Authorization
+      prefix: Bearer
+    rate_limit:
+      daily_limit_header: X-Daily-Limit
+      daily_remaining_header: X-Daily-Remaining
+
+credential_pools:
+  weather:
+    keys:
+      - label: primary
+        key: real-weather-key
+```
+
+## 环境变量覆盖
+
+- `GW_SERVER_PORT` 覆盖监听端口。
+- `GW_ADMIN_KEY` 覆盖管理后台登录 key。
+- `GW_LOG_FILE` 覆盖结构化日志文件路径。
+- 新配置：`GW_KEY_<POOL>_<LABEL>` 覆盖指定池内 key。
+  - `api-sports` + `key-1` → `GW_KEY_API_SPORTS_KEY_1`
+  - `weather` + `primary` → `GW_KEY_WEATHER_PRIMARY`
+- 兼容旧配置：`GW_KEY_<LABEL>` 仍可覆盖旧顶层 `keys`。
+
+非法的 `GW_SERVER_PORT` 会在启动时报错，不会静默回退。
+
+## 管理端点
 
 | 端点 | 说明 |
 |------|------|
-| `GET /__gateway/status` | 各 key 脱敏额度状态 JSON（key 仅显示 `****` + 尾 4 位） |
-| `GET /__gateway/health` | 健康检查，返回 `{"status":"ok"}` |
-
-`/__gateway/` 为管理命名空间（不受 workspace 路由影响），其余所有路径按 `/<workspace>/...` 转发到对应上游。
+| `GET /__gateway/status` | 所有 credential pool 的脱敏 key 状态 |
+| `GET /__gateway/health` | 健康检查 |
+| `POST /__gateway/admin/session` | 管理后台登录 |
+| `GET /__gateway/admin/overview` | dashboard 数据 |
+| `GET / PUT /__gateway/admin/config` | 读取/写回配置并热重载 |
+| `GET / DELETE /__gateway/admin/logs` | 查询/清空文件日志 |
+| `GET /__gateway/admin/docs` | 动态接口文档 |
 
 示例：
 
 ```bash
 curl http://127.0.0.1:8080/__gateway/status
-# {"keys":[{"label":"key-1","masked_key":"****a3f9","status":"active","daily_limit":7500,"daily_remaining":7499,...}]}
 ```
 
-## 上游错误处理（下游无感知）
+返回结构按池分组：
 
-| 上游情况 | 网关行为 | 是否换 key |
-|---------|---------|-----------|
-| 2xx 正常 | 更新额度 → 原样回传 | 否 |
-| 429 限速 | 标记限速 + 冷却 → 换 key 重试 | 是 |
-| 当日额度耗尽 | 标记耗尽 → 换 key 重试 | 是 |
-| 401 / 403 key 失效 | 标记 key 失效 + 告警 → 换 key 重试 | 是 |
-| 5xx / 网络错误 | 累计错误 → 换 key 重试 | 是 |
-| 其余 4xx（参数错误等） | 原样回传，不重试 | 否 |
-
-全部 key 不可用时返回 `503` + `Retry-After` header + JSON 错误体（含各 key 状态）。
-
-## 项目结构
-
+```json
+{
+  "credential_pools": [
+    {
+      "name": "api-sports",
+      "keys": [
+        {
+          "label": "key-1",
+          "masked_key": "****1234",
+          "status": "active",
+          "daily_limit": 100,
+          "daily_remaining": 80
+        }
+      ]
+    }
+  ]
+}
 ```
-cmd/gateway/main.go      入口：加载配置、装配组件、启服务、优雅关闭
-internal/config/         配置加载、环境变量覆盖、校验
-internal/keypool/        key 状态机、顺序耗尽调度、额度 header 解析
-internal/auth/           客户端 Authorization 校验钩子（初版直通）
-internal/proxy/          中转管线：换 key 重试、下游无感知
-internal/admin/          管理端点（status / health）
-```
+
+## 旧配置兼容
+
+旧版 `workspaces + keys` 配置仍可加载。启动时会自动转换为：
+
+- 每个 `workspaces.<name>` → 一个 `api_sports` platform。
+- 顶层 `keys` → `credential_pools.default.keys`。
+
+旧请求路径如 `/football/fixtures` 保持可用。
 
 ## 测试
 
 ```bash
-go test -race ./...      # 全量测试 + 竞态检测
-go test -cover ./...     # 覆盖率（各业务包 >= 80%）
+go test ./...
+go test -race ./...
 ```
-
-## 设计与计划文档
-
-- 设计：`docs/superpowers/specs/2026-06-07-api-football-gateway-design.md`
-- 实现计划：`docs/superpowers/plans/2026-06-07-api-football-gateway.md`
