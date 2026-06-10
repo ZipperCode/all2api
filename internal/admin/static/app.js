@@ -4,10 +4,29 @@ const state = {
   overview: null,
   config: null,
   logs: [],
+  loading: false,
+  error: "",
+  saving: false,
+  logsLoading: false,
+  logsError: "",
   dirty: false,
   selectedProvider: "",
+  drawer: null,
+  toast: null,
+  toastTimer: null,
+  logFilterTimer: null,
   visibleKeys: new Set(),
+  selectedRows: { keys: new Set() },
   logFilters: { kind: "", level: "", platform: "" },
+  sort: {
+    platforms: { key: "name", direction: "asc" },
+    keys: { key: "status", direction: "desc" },
+    pools: { key: "status", direction: "desc" },
+    logs: { key: "time", direction: "desc" },
+  },
+  pagination: {
+    logs: { page: 1, pageSize: 50 },
+  },
 };
 
 const views = {
@@ -74,18 +93,31 @@ async function login(key) {
 }
 
 async function loadAll() {
-  setStatus("加载中");
-  const [overview, config, logs] = await Promise.all([
-    api("/__gateway/admin/overview"),
-    api("/__gateway/admin/config"),
-    api("/__gateway/admin/logs?limit=160"),
-  ]);
-  state.overview = overview;
-  state.config = config;
-  state.logs = logs.events || [];
-  state.dirty = false;
+  state.loading = true;
+  state.error = "";
   render();
-  setStatus("");
+  setStatus("加载中");
+  try {
+    const [overview, config, logs] = await Promise.all([
+      api("/__gateway/admin/overview"),
+      api("/__gateway/admin/config"),
+      api("/__gateway/admin/logs?limit=160"),
+    ]);
+    state.overview = overview;
+    state.config = config;
+    state.logs = logs.events || [];
+    state.dirty = false;
+    state.logsError = "";
+    setStatus("");
+  } catch (error) {
+    state.error = error.message;
+    setStatus(error.message);
+    showToast(`加载失败：${error.message}`, "error");
+    throw error;
+  } finally {
+    state.loading = false;
+    render();
+  }
 }
 
 function render() {
@@ -93,7 +125,7 @@ function render() {
   const [kicker, title] = views[state.view];
   $("#view-kicker").textContent = kicker;
   $("#view-title").textContent = title;
-  $("#save-config").classList.toggle("hidden", state.view !== "keys");
+  syncSaveButton();
   document.querySelectorAll(".nav-tab").forEach((tab) => {
     const active = tab.dataset.view === state.view;
     tab.classList.toggle("active", active);
@@ -105,10 +137,28 @@ function render() {
   renderDashboard();
   renderKeys();
   renderLogs();
+  renderDrawer();
+  renderToast();
+}
+
+function syncSaveButton() {
+  const saveButton = $("#save-config");
+  saveButton.classList.toggle("hidden", state.view !== "keys");
+  saveButton.disabled = !state.dirty || state.saving || !state.config;
+  saveButton.textContent = state.saving ? "保存中" : state.dirty ? "保存配置" : "已保存";
+  saveButton.classList.toggle("dirty", state.dirty);
 }
 
 function renderDashboard() {
   const root = $("#dashboard-view");
+  if (state.loading && !state.overview) {
+    root.replaceChildren(dashboardSkeleton());
+    return;
+  }
+  if (state.error && !state.overview) {
+    root.replaceChildren(errorState("控制台加载失败", state.error, () => loadAll().catch(() => {})));
+    return;
+  }
   if (!state.overview) return;
 
   root.replaceChildren(
@@ -137,30 +187,56 @@ function runtimeRow(label, value) {
 
 function metricGrid(overview) {
   return node("div", { class: "metric-grid" },
+    metricTile("可用密钥", overview.active_key_count, "success"),
+    metricTile("异常密钥", overview.problem_key_count, overview.problem_key_count ? "danger" : ""),
+    metricTile("总密钥", overview.key_count),
     metricTile("命名空间", overview.platform_count),
     metricTile("密钥池", overview.credential_pool_count),
-    metricTile("总密钥", overview.key_count),
-    metricTile("可用密钥", overview.active_key_count),
-    metricTile("异常密钥", overview.problem_key_count),
   );
 }
 
-function metricTile(label, value) {
-  return node("div", { class: "metric-tile" }, node("span", {}, label), node("strong", {}, value));
+function metricTile(label, value, tone = "") {
+  return node("div", { class: `metric-tile${tone ? ` ${tone}` : ""}` }, node("span", {}, label), node("strong", {}, value));
 }
 
 function platformOverviewTable(platforms) {
-  if (!platforms.length) return empty();
-  return table(
-    ["命名空间", "类型", "Base URL", "密钥池", "超时", "认证头"],
-    platforms.map((platform) => [
+  if (!platforms.length) return emptyState("暂无命名空间", "在 config.yaml 添加 platforms 后，这里会显示路由前缀、认证头和上游地址。");
+  const rows = sortTableRows(platforms.map((platform) => ({
+    id: platform.name,
+    raw: platform,
+    sortValues: {
+      name: platform.name,
+      type: platform.type,
+      base_url: platform.base_url,
+      credential_pool: platform.credential_pool,
+      timeout: platform.timeout_seconds || 30,
+      auth_header: platform.auth_header || platform.auth?.header || "x-apisports-key",
+    },
+    cells: [
       strongText(platform.name),
       statusPill(platform.type),
       truncate(platform.base_url),
       platform.credential_pool || "-",
       `${platform.timeout_seconds || 30}s`,
       platform.auth_header || platform.auth?.header || "x-apisports-key",
-    ]),
+    ],
+  })), "platforms");
+  return table(
+    [
+      column("命名空间", "name"),
+      column("类型", "type"),
+      column("Base URL", "base_url"),
+      column("密钥池", "credential_pool"),
+      column("超时", "timeout"),
+      column("认证头", "auth_header"),
+    ],
+    rows,
+    "platform-table",
+    {
+      sortId: "platforms",
+      emptyTitle: "暂无命名空间",
+      onRowClick: (row) => openDrawer("platform", row.raw),
+    },
   );
 }
 
@@ -172,6 +248,14 @@ function platformEntries() {
 
 function renderKeys() {
   const root = $("#keys-view");
+  if (state.loading && !state.config) {
+    root.replaceChildren(keysSkeleton());
+    return;
+  }
+  if (state.error && !state.config) {
+    root.replaceChildren(errorState("配置加载失败", state.error, () => loadAll().catch(() => {})));
+    return;
+  }
   if (!state.config) return;
   const providers = platformEntries();
   const selected = ensureSelectedProvider(providers);
@@ -230,6 +314,7 @@ function providerItem(provider) {
     "aria-pressed": active ? "true" : "false",
     onClick: () => {
       state.selectedProvider = provider.name;
+      state.selectedRows.keys.clear();
       renderKeys();
     },
   },
@@ -286,12 +371,22 @@ function linkedNamespaces(providers) {
 }
 
 function keyManagementTable(poolName, keys) {
-  return table(
-    ["Label", "密钥值", "状态", "Masked", "Daily", "Minute", "错误", "操作"],
-    keys.map((key, index) => {
-      const runtime = runtimeKey(poolName, key, index);
-      const visible = state.visibleKeys.has(keyVisibilityId(poolName, index));
-      return [
+  const rows = sortTableRows(keys.map((key, index) => {
+    const runtime = runtimeKey(poolName, key, index);
+    const visible = state.visibleKeys.has(keyVisibilityId(poolName, index));
+    return {
+      id: keySelectionId(poolName, index),
+      raw: { poolName, key, runtime, index },
+      sortValues: {
+        label: key.label,
+        key: key.key,
+        status: keyRuntimeStatus(key, runtime),
+        masked: runtime?.masked_key || maskSecret(key.key),
+        daily: runtime?.daily_remaining ?? -1,
+        minute: runtime?.minute_remaining ?? -1,
+        error: runtime?.last_error || "",
+      },
+      cells: [
         input(key.label || "", (value) => updateKey(poolName, index, "label", value), "table-input", "text", "", "input", { "aria-label": "密钥标签" }),
         node("div", { class: "secret-field" },
           input(key.key || "", (value) => updateKey(poolName, index, "key", value), key.key ? "table-input" : "table-input input-warning", visible ? "text" : "password", "粘贴上游 API Key", "input", { "aria-label": "密钥值" }),
@@ -303,9 +398,34 @@ function keyManagementTable(poolName, keys) {
         runtime?.minute_remaining ?? "-",
         truncate(runtime?.last_error || "-"),
         node("div", { class: "inline-actions" }, button("删除", "text danger", () => deleteKey(poolName, index))),
-      ];
-    }),
+      ],
+    };
+  }), "keys");
+
+  return table(
+    [
+      column("Label", "label"),
+      column("密钥值", "key", { sortable: false }),
+      column("状态", "status"),
+      column("Masked", "masked"),
+      column("Daily", "daily"),
+      column("Minute", "minute"),
+      column("错误", "error"),
+      column("操作", "", { sortable: false }),
+    ],
+    rows,
     "credential-table",
+    {
+      sortId: "keys",
+      selectable: true,
+      selectedSet: state.selectedRows.keys,
+      bulkActions: [
+        button("删除选中", "text danger", () => deleteSelectedKeys(poolName)),
+        button("全部隐藏", "secondary", () => hideSelectedKeys(poolName)),
+      ],
+      onSelectionChange: renderKeys,
+      onRowClick: (row) => openDrawer("key", row.raw),
+    },
   );
 }
 
@@ -393,6 +513,11 @@ function keyRuntimePill(key, runtime) {
   return statusPill(runtime.status);
 }
 
+function keyRuntimeStatus(key, runtime) {
+  if (!key.key) return "pending_value";
+  return runtime?.status || "pending_save";
+}
+
 function keyHealth(poolName) {
   const configured = configPool(poolName).keys || [];
   const runtimeKeys = runtimePool(poolName).keys || [];
@@ -428,20 +553,23 @@ function maskSecret(value) {
 
 function renderLogs() {
   const root = $("#logs-view");
+  const activeFilters = logFilterChips();
   root.replaceChildren(
     stack(
       section("事件日志", "按类型、级别和命名空间过滤",
-        node("div", { class: "toolbar" },
+        node("div", { class: "toolbar log-toolbar" },
           node("div", { class: "filters" },
-            select(state.logFilters.kind, ["", "proxy", "admin"], (value) => { state.logFilters.kind = value; refreshLogs(); }, "类型"),
-            select(state.logFilters.level, ["", "info", "warn", "error"], (value) => { state.logFilters.level = value; refreshLogs(); }, "级别"),
-            input(state.logFilters.platform, (value) => { state.logFilters.platform = value; refreshLogs(); }, "table-input", "text", "命名空间", "input", { "aria-label": "命名空间过滤" }),
+            select(state.logFilters.kind, ["", "proxy", "admin"], (value) => updateLogFilter("kind", value), "类型"),
+            select(state.logFilters.level, ["", "info", "warn", "error"], (value) => updateLogFilter("level", value), "级别"),
+            input(state.logFilters.platform, (value) => updateLogFilter("platform", value), "table-input filter-input", "text", "命名空间", "input", { "aria-label": "命名空间过滤" }),
+            activeFilters.length ? node("div", { class: "filter-chips", "aria-label": "当前过滤条件" }, activeFilters) : null,
           ),
           node("div", { class: "inline-actions" },
             button("刷新日志", "secondary", refreshLogs),
             button("清空日志", "text danger", clearLogs),
           ),
         ),
+        activeFilters.length ? node("button", { class: "button text reset-filters", type: "button", onClick: resetLogFilters }, "重置过滤") : null,
         eventTable(state.logs),
       ),
     ),
@@ -449,18 +577,56 @@ function renderLogs() {
 }
 
 function eventTable(events) {
-  if (!events.length) return empty();
-  return table(
-    ["时间", "类型", "级别", "命名空间", "消息", "状态码"],
-    events.map((event) => [
+  if (state.logsError) return errorState("日志加载失败", state.logsError, () => refreshLogs().catch(() => {}));
+  if (state.logsLoading || (state.loading && !events.length)) {
+    return table(
+      [column("时间"), column("类型"), column("级别"), column("命名空间"), column("消息"), column("状态码")],
+      [],
+      "log-table",
+      { loading: true, loadingRows: 7 },
+    );
+  }
+  if (!events.length) return emptyState("暂无日志", "触发一次网关请求后，这里会显示代理、管理操作和错误事件。", button("刷新日志", "secondary", refreshLogs));
+  const rows = sortTableRows(events.map((event, index) => ({
+    id: event.id || `${event.time || "event"}:${index}`,
+    raw: event,
+    sortValues: {
+      time: event.time ? new Date(event.time).getTime() : 0,
+      kind: event.kind || "",
+      level: event.level || "info",
+      platform: event.platform || "",
+      message: event.message || event.action || "",
+      status_code: event.status_code || 0,
+    },
+    cells: [
       formatTime(event.time),
       statusPill(event.kind || "event"),
       levelPill(event.level || "info"),
       event.platform || "-",
       node("span", { class: "event-message", title: event.message || event.action || "" }, event.message || event.action || "-"),
       event.status_code || "-",
-    ]),
+    ],
+  })), "logs");
+  return table(
+    [
+      column("时间", "time"),
+      column("类型", "kind"),
+      column("级别", "level"),
+      column("命名空间", "platform"),
+      column("消息", "message"),
+      column("状态码", "status_code"),
+    ],
+    rows,
     "log-table",
+    {
+      sortId: "logs",
+      pagination: state.pagination.logs,
+      onPageChange: (page) => {
+        state.pagination.logs.page = page;
+        renderLogs();
+      },
+      onRowClick: (row) => openDrawer("log", row.raw),
+    },
   );
 }
 
@@ -468,19 +634,48 @@ function poolStatusTable(pools) {
   const rows = [];
   pools.forEach((pool) => {
     (pool.keys || []).forEach((key) => {
-      rows.push([
-        pool.name,
-        key.label,
-        truncate(key.masked_key),
-        statusPill(key.status),
-        key.daily_remaining || 0,
-        key.minute_remaining || 0,
-        truncate(key.last_error || "-"),
-      ]);
+      rows.push({
+        id: `${pool.name}:${key.label}`,
+        raw: { pool, key },
+        sortValues: {
+          pool: pool.name,
+          label: key.label,
+          masked: key.masked_key,
+          status: key.status,
+          daily: key.daily_remaining || 0,
+          minute: key.minute_remaining || 0,
+          error: key.last_error || "",
+        },
+        cells: [
+          pool.name,
+          key.label,
+          truncate(key.masked_key),
+          statusPill(key.status),
+          key.daily_remaining || 0,
+          key.minute_remaining || 0,
+          truncate(key.last_error || "-"),
+        ],
+      });
     });
   });
-  if (!rows.length) return empty();
-  return table(["密钥池", "Label", "Masked key", "状态", "Daily", "Minute", "Last error"], rows);
+  if (!rows.length) return emptyState("暂无密钥状态", "添加并保存密钥后，这里会显示运行态健康度和额度。");
+  return table(
+    [
+      column("密钥池", "pool"),
+      column("Label", "label"),
+      column("Masked key", "masked"),
+      column("状态", "status"),
+      column("Daily", "daily"),
+      column("Minute", "minute"),
+      column("Last error", "error"),
+    ],
+    sortTableRows(rows, "pools"),
+    "pool-table",
+    {
+      sortId: "pools",
+      onRowClick: (row) => openDrawer("pool-key", row.raw),
+    },
+  );
 }
 
 function stack(...children) {
@@ -496,13 +691,168 @@ function section(title, subtitle, ...children) {
   );
 }
 
-function table(headings, rows, className = "") {
-  return node("div", { class: "table-wrap" },
-    node("table", { class: className },
-      node("thead", {}, node("tr", {}, headings.map((heading) => node("th", {}, heading)))),
-      node("tbody", {}, rows.map((row) => node("tr", {}, row.map((content) => cell(content))))),
+function column(label, key = "", options = {}) {
+  return { label, key, sortable: Boolean(key) && options.sortable !== false };
+}
+
+// DataTable 统一处理后台表格的排序、选择、分页和加载态，避免每个视图重复实现交互细节。
+function table(headings, rows, className = "", options = {}) {
+  const columns = headings.map((heading) => typeof heading === "string" ? column(heading) : heading);
+  const normalizedRows = rows.map((row, index) => normalizeRow(row, index));
+  const pageRows = paginateRows(normalizedRows, options.pagination);
+  const visibleRows = options.loading ? skeletonRows(columns.length, options.loadingRows || 6) : pageRows;
+  const selectable = Boolean(options.selectable);
+  const selectedSet = options.selectedSet || new Set();
+  const visibleIds = pageRows.map((row) => row.id);
+  const allSelected = visibleIds.length > 0 && visibleIds.every((id) => selectedSet.has(id));
+  const selectedCount = selectedSet.size;
+
+  return node("div", { class: "data-table-shell" },
+    selectable && selectedCount ? bulkBar(selectedCount, options.bulkActions || []) : null,
+    node("div", { class: `table-wrap${options.loading ? " loading" : ""}` },
+      node("table", { class: className },
+        node("thead", {},
+          node("tr", {},
+            selectable ? node("th", { class: "select-col" },
+              checkbox(allSelected, "选择当前页", (checked) => toggleVisibleRows(visibleIds, selectedSet, checked, options.onSelectionChange)),
+            ) : null,
+            columns.map((item) => node("th", {}, sortHeader(item, options.sortId))),
+          ),
+        ),
+        node("tbody", {},
+          visibleRows.map((row) => tableRow(row, columns, {
+            selectable,
+            selectedSet,
+            onSelectionChange: options.onSelectionChange,
+            onRowClick: options.onRowClick,
+          })),
+        ),
+      ),
+    ),
+    !options.loading && !normalizedRows.length ? emptyState(options.emptyTitle || "暂无数据", options.emptyMessage || "当前视图没有可显示的数据。") : null,
+    options.pagination && normalizedRows.length ? paginationControls(normalizedRows.length, options.pagination, options.onPageChange) : null,
+  );
+}
+
+function normalizeRow(row, index) {
+  if (Array.isArray(row)) return { id: String(index), cells: row, sortValues: {}, raw: row };
+  return { id: String(row.id || index), cells: row.cells || [], sortValues: row.sortValues || {}, raw: row.raw ?? row };
+}
+
+function skeletonRows(columnCount, count) {
+  return Array.from({ length: count }, (_, index) => ({
+    id: `skeleton-${index}`,
+    cells: Array.from({ length: columnCount }, () => node("span", { class: "skeleton-line" })),
+    sortValues: {},
+  }));
+}
+
+function tableRow(row, columns, options) {
+  const selected = options.selectedSet?.has(row.id);
+  const clickProps = options.onRowClick && !row.id.startsWith("skeleton-") ? {
+    tabIndex: "0",
+    onClick: (event) => {
+      if (event.target.closest("button,input,select,a,label")) return;
+      options.onRowClick(row);
+    },
+    onKeydown: (event) => {
+      if (event.key !== "Enter" && event.key !== " ") return;
+      event.preventDefault();
+      options.onRowClick(row);
+    },
+  } : {};
+
+  return node("tr", { class: `${options.onRowClick ? "clickable" : ""}${selected ? " selected" : ""}`, ...clickProps },
+    options.selectable ? node("td", { class: "select-col" },
+      checkbox(selected, "选择行", (checked) => {
+        if (checked) options.selectedSet.add(row.id);
+        else options.selectedSet.delete(row.id);
+        options.onSelectionChange?.();
+      }),
+    ) : null,
+    columns.map((_, index) => cell(row.cells[index] ?? "")),
+  );
+}
+
+function sortHeader(item, sortId) {
+  if (!item.sortable || !sortId) return item.label;
+  const current = state.sort[sortId] || {};
+  const active = current.key === item.key;
+  const direction = active ? current.direction : "none";
+  return node("button", {
+    class: `table-sort${active ? " active" : ""}`,
+    type: "button",
+    "aria-sort": active ? (direction === "asc" ? "ascending" : "descending") : "none",
+    onClick: () => {
+      toggleSort(sortId, item.key);
+      render();
+    },
+  }, item.label, node("span", { "aria-hidden": "true" }, active ? (direction === "asc" ? "↑" : "↓") : "↕"));
+}
+
+function toggleSort(sortId, key) {
+  const current = state.sort[sortId] || {};
+  state.sort[sortId] = {
+    key,
+    direction: current.key === key && current.direction === "asc" ? "desc" : "asc",
+  };
+}
+
+function sortTableRows(rows, sortId) {
+  const current = state.sort[sortId];
+  if (!current?.key) return rows;
+  const direction = current.direction === "desc" ? -1 : 1;
+  return [...rows].sort((a, b) => compareSortValues(a.sortValues?.[current.key], b.sortValues?.[current.key]) * direction);
+}
+
+function compareSortValues(a, b) {
+  const left = a === null || a === undefined ? "" : a;
+  const right = b === null || b === undefined ? "" : b;
+  if (typeof left === "number" && typeof right === "number") return left - right;
+  return String(left).localeCompare(String(right), undefined, { numeric: true, sensitivity: "base" });
+}
+
+function paginateRows(rows, pagination) {
+  if (!pagination) return rows;
+  const totalPages = Math.max(1, Math.ceil(rows.length / pagination.pageSize));
+  pagination.page = Math.min(Math.max(1, pagination.page), totalPages);
+  const start = (pagination.page - 1) * pagination.pageSize;
+  return rows.slice(start, start + pagination.pageSize);
+}
+
+function paginationControls(total, pagination, onPageChange) {
+  const totalPages = Math.max(1, Math.ceil(total / pagination.pageSize));
+  const start = total ? (pagination.page - 1) * pagination.pageSize + 1 : 0;
+  const end = Math.min(total, pagination.page * pagination.pageSize);
+  return node("div", { class: "table-pagination" },
+    node("span", {}, `${start}-${end} / ${total}`),
+    node("div", { class: "inline-actions" },
+      node("button", { class: "button secondary", type: "button", disabled: pagination.page <= 1 ? "disabled" : null, onClick: () => onPageChange?.(pagination.page - 1) }, "上一页"),
+      node("button", { class: "button secondary", type: "button", disabled: pagination.page >= totalPages ? "disabled" : null, onClick: () => onPageChange?.(pagination.page + 1) }, "下一页"),
     ),
   );
+}
+
+function bulkBar(count, actions) {
+  return node("div", { class: "bulk-bar" },
+    node("strong", {}, `已选择 ${count} 项`),
+    node("div", { class: "inline-actions" }, actions),
+  );
+}
+
+function checkbox(checked, label, onChange) {
+  return node("label", { class: "table-checkbox" },
+    node("input", { type: "checkbox", checked: checked ? "checked" : null, "aria-label": label, onChange: (event) => onChange(event.target.checked) }),
+    node("span", { class: "sr-only" }, label),
+  );
+}
+
+function toggleVisibleRows(ids, selectedSet, checked, onSelectionChange) {
+  ids.forEach((id) => {
+    if (checked) selectedSet.add(id);
+    else selectedSet.delete(id);
+  });
+  onSelectionChange?.();
 }
 
 function field(label, control) {
@@ -524,13 +874,18 @@ function select(value, options, onChange, label = "") {
 }
 
 function button(label, variant, onClick) {
-  return node("button", { class: `button ${variant}`, type: "button", onClick }, label);
+  return node("button", { class: `button ${variant}`, type: "button", onClick: () => handleAction(onClick) }, label);
 }
 
 function iconButton(label, title, onClick, icon) {
-  return node("button", { class: "icon-button", type: "button", title, "aria-label": label, onClick },
+  return node("button", { class: "icon-button", type: "button", title, "aria-label": label, onClick: () => handleAction(onClick) },
     node("span", { class: `icon ${icon}`, "aria-hidden": "true" }),
   );
+}
+
+function handleAction(action) {
+  const result = action?.();
+  if (result?.catch) result.catch((error) => setStatus(error.message));
 }
 
 function kv(label, value) {
@@ -564,7 +919,54 @@ function levelPill(level) {
 }
 
 function empty() {
-  return document.querySelector("#empty-template").content.cloneNode(true);
+  return emptyState("暂无数据", "当前视图没有可显示的数据。");
+}
+
+function emptyState(title, message, action = null) {
+  return node("div", { class: "empty-state" },
+    node("div", { class: "state-icon", "aria-hidden": "true" }),
+    node("strong", {}, title),
+    message ? node("p", {}, message) : null,
+    action ? node("div", { class: "empty-actions" }, action) : null,
+  );
+}
+
+function errorState(title, message, retry) {
+  return node("div", { class: "empty-state error-state" },
+    node("div", { class: "state-icon", "aria-hidden": "true" }),
+    node("strong", {}, title),
+    node("p", {}, message || "请求失败，请稍后重试。"),
+    retry ? node("div", { class: "empty-actions" }, button("重试", "secondary", retry)) : null,
+  );
+}
+
+function dashboardSkeleton() {
+  return stack(
+    node("div", { class: "overview-grid" },
+      node("section", { class: "card" }, node("div", { class: "metric-grid" },
+        Array.from({ length: 5 }, () => node("div", { class: "metric-tile skeleton-tile" }, node("span", { class: "skeleton-line" }), node("strong", { class: "skeleton-line" }))),
+      )),
+      node("section", { class: "card dark" }, node("div", { class: "runtime-list" },
+        Array.from({ length: 3 }, () => node("div", { class: "runtime-row" }, node("span", { class: "skeleton-line" }), node("strong", { class: "skeleton-line" }))),
+      )),
+    ),
+    section("命名空间状态", "当前站点前缀与上游配置", table([column("命名空间"), column("类型"), column("Base URL"), column("密钥池"), column("超时"), column("认证头")], [], "platform-table", { loading: true })),
+    section("密钥状态", "运行态密钥健康度", table([column("密钥池"), column("Label"), column("Masked key"), column("状态"), column("Daily"), column("Minute"), column("Last error")], [], "pool-table", { loading: true })),
+  );
+}
+
+function keysSkeleton() {
+  return stack(
+    section("提供商密钥", "选择当前配置里的提供商，再维护它绑定的上游密钥",
+      node("div", { class: "provider-layout" },
+        node("aside", { class: "provider-rail skeleton-panel" }, Array.from({ length: 4 }, () => node("div", { class: "provider-item" }, node("span", { class: "skeleton-line" }), node("span", { class: "skeleton-line" })))),
+        node("article", { class: "credential-panel" },
+          node("div", { class: "credential-hero" }, node("div", {}, node("span", { class: "skeleton-line" }), node("span", { class: "skeleton-line" }))),
+          node("div", { class: "key-management-body" }, table([column("Label"), column("密钥值"), column("状态"), column("Masked"), column("Daily"), column("Minute"), column("错误"), column("操作")], [], "credential-table", { loading: true })),
+        ),
+      ),
+    ),
+  );
 }
 
 function formatTime(value) {
@@ -572,13 +974,194 @@ function formatTime(value) {
   return new Date(value).toLocaleString();
 }
 
+function logFilterChips() {
+  return Object.entries(state.logFilters)
+    .filter(([, value]) => value)
+    .map(([key, value]) => node("button", { class: "filter-chip", type: "button", onClick: () => updateLogFilter(key, "") }, `${logFilterLabel(key)}: ${value}`));
+}
+
+function logFilterLabel(key) {
+  if (key === "kind") return "类型";
+  if (key === "level") return "级别";
+  return "命名空间";
+}
+
+function updateLogFilter(key, value) {
+  state.logFilters[key] = value;
+  state.pagination.logs.page = 1;
+  if (key !== "platform") renderLogs();
+  queueRefreshLogs();
+}
+
+function queueRefreshLogs() {
+  clearTimeout(state.logFilterTimer);
+  state.logFilterTimer = setTimeout(() => {
+    refreshLogs().catch(() => {});
+  }, 250);
+}
+
+function resetLogFilters() {
+  state.logFilters = { kind: "", level: "", platform: "" };
+  state.pagination.logs.page = 1;
+  refreshLogs().catch(() => {});
+}
+
+function openDrawer(type, data) {
+  state.drawer = { type, data };
+  renderDrawer();
+}
+
+function closeDrawer() {
+  state.drawer = null;
+  renderDrawer();
+}
+
+function renderDrawer() {
+  const root = $("#drawer-root");
+  if (!root) return;
+  if (!state.drawer) {
+    root.replaceChildren();
+    root.classList.remove("open");
+    return;
+  }
+  root.classList.add("open");
+  const content = drawerContent(state.drawer);
+  root.replaceChildren(
+    node("div", { class: "drawer-backdrop", onClick: closeDrawer }),
+    node("aside", { class: "detail-drawer", role: "dialog", "aria-modal": "true", "aria-labelledby": "drawer-title" },
+      node("header", { class: "drawer-header" },
+        node("div", {}, node("p", { class: "eyebrow" }, content.kicker), node("h3", { id: "drawer-title" }, content.title), content.subtitle ? node("p", {}, content.subtitle) : null),
+        iconButton("关闭详情", "Close detail", closeDrawer, "close"),
+      ),
+      node("div", { class: "drawer-body" }, content.body),
+      content.actions ? node("footer", { class: "drawer-actions" }, content.actions) : null,
+    ),
+  );
+}
+
+function drawerContent(drawer) {
+  if (drawer.type === "log") return logDrawer(drawer.data);
+  if (drawer.type === "platform") return platformDrawer(drawer.data);
+  if (drawer.type === "key") return keyDrawer(drawer.data);
+  if (drawer.type === "pool-key") return poolKeyDrawer(drawer.data);
+  return { kicker: "Detail", title: "详情", body: emptyState("暂无详情", "当前行没有可展示的详情。") };
+}
+
+function logDrawer(event) {
+  return {
+    kicker: "Event",
+    title: event.message || event.action || "日志详情",
+    subtitle: formatTime(event.time),
+    body: node("div", { class: "drawer-stack" },
+      kvGrid([
+        ["类型", event.kind || "-"],
+        ["级别", event.level || "-"],
+        ["命名空间", event.platform || "-"],
+        ["状态码", event.status_code || "-"],
+        ["耗时", event.duration_ms ? `${event.duration_ms}ms` : "-"],
+        ["尝试次数", event.attempts || "-"],
+        ["客户端", event.remote_addr || "-"],
+        ["错误", event.error || "-"],
+      ]),
+      node("div", { class: "drawer-section" },
+        node("h4", {}, "原始事件"),
+        node("pre", {}, JSON.stringify(event, null, 2)),
+      ),
+    ),
+  };
+}
+
+function platformDrawer(platform) {
+  return {
+    kicker: "Namespace",
+    title: `/${platform.name}`,
+    subtitle: platform.base_url || "",
+    body: node("div", { class: "drawer-stack" },
+      kvGrid([
+        ["类型", platform.type || "-"],
+        ["密钥池", platform.credential_pool || "-"],
+        ["超时", `${platform.timeout_seconds || 30}s`],
+        ["认证头", platform.auth_header || platform.auth?.header || "x-apisports-key"],
+        ["认证前缀", platform.auth_prefix || platform.auth?.prefix || "-"],
+      ]),
+    ),
+  };
+}
+
+function keyDrawer(detail) {
+  return {
+    kicker: "Credential",
+    title: detail.key.label || `key-${detail.index + 1}`,
+    subtitle: detail.poolName,
+    body: node("div", { class: "drawer-stack" },
+      kvGrid([
+        ["状态", keyRuntimeStatus(detail.key, detail.runtime)],
+        ["Masked key", detail.runtime?.masked_key || maskSecret(detail.key.key)],
+        ["Daily", detail.runtime?.daily_remaining ?? "-"],
+        ["Minute", detail.runtime?.minute_remaining ?? "-"],
+        ["Last error", detail.runtime?.last_error || "-"],
+      ]),
+      node("div", { class: "drawer-section danger-zone" },
+        node("h4", {}, "危险操作"),
+        node("p", {}, "删除后需要保存配置才会热重载。"),
+      ),
+    ),
+    actions: node("div", { class: "inline-actions" }, button("删除密钥", "text danger", () => deleteKey(detail.poolName, detail.index))),
+  };
+}
+
+function poolKeyDrawer(detail) {
+  return {
+    kicker: "Runtime key",
+    title: detail.key.label || detail.pool.name,
+    subtitle: detail.pool.name,
+    body: kvGrid([
+      ["状态", detail.key.status || "-"],
+      ["Masked key", detail.key.masked_key || "-"],
+      ["Daily", detail.key.daily_remaining ?? "-"],
+      ["Minute", detail.key.minute_remaining ?? "-"],
+      ["Cooldown until", detail.key.cooldown_until || "-"],
+      ["Last error", detail.key.last_error || "-"],
+    ]),
+  };
+}
+
+function kvGrid(items) {
+  return node("div", { class: "kv-grid" }, items.map(([label, value]) => kv(label, value)));
+}
+
+function showToast(message, tone = "info") {
+  clearTimeout(state.toastTimer);
+  state.toast = { message, tone };
+  renderToast();
+  state.toastTimer = setTimeout(() => {
+    state.toast = null;
+    renderToast();
+  }, 2600);
+}
+
+function renderToast() {
+  const root = $("#toast-root");
+  if (!root) return;
+  if (!state.toast) {
+    root.replaceChildren();
+    return;
+  }
+  root.replaceChildren(node("div", { class: `toast ${state.toast.tone}` }, state.toast.message));
+}
+
 function markDirty() {
   state.dirty = true;
   setStatus("未保存");
+  syncSaveButton();
 }
 
 function keyVisibilityId(poolName, index) {
   return `${poolName}:${index}`;
+}
+
+function keySelectionId(poolName, index) {
+  return `key:${poolName}:${index}`;
 }
 
 function toggleKeyVisibility(poolName, index) {
@@ -598,6 +1181,7 @@ function addKey(poolName) {
   pool.keys.push({ label: nextKeyLabel(pool.keys), key: "" });
   markDirty();
   setStatus("已新增密钥，未保存");
+  showToast("已新增密钥，保存后生效", "success");
   renderKeys();
 }
 
@@ -615,10 +1199,46 @@ function updateKey(poolName, index, key, value) {
 }
 
 function deleteKey(poolName, index) {
+  if (!window.confirm("确认删除这条密钥？保存配置后会立即热重载。")) return;
   state.config.credential_pools[poolName].keys.splice(index, 1);
   state.visibleKeys.delete(keyVisibilityId(poolName, index));
+  state.selectedRows.keys.clear();
+  closeDrawer();
   markDirty();
+  showToast("密钥已删除，保存后生效", "success");
   renderKeys();
+}
+
+function deleteSelectedKeys(poolName) {
+  const indexes = selectedKeyIndexes(poolName);
+  if (!indexes.length) return;
+  if (!window.confirm(`确认删除选中的 ${indexes.length} 条密钥？保存配置后会立即热重载。`)) return;
+  const pool = ensureConfigPool(poolName);
+  indexes.sort((a, b) => b - a).forEach((index) => {
+    pool.keys.splice(index, 1);
+    state.visibleKeys.delete(keyVisibilityId(poolName, index));
+  });
+  state.selectedRows.keys.clear();
+  markDirty();
+  showToast(`已删除 ${indexes.length} 条密钥，保存后生效`, "success");
+  renderKeys();
+}
+
+function hideSelectedKeys(poolName) {
+  selectedKeyIndexes(poolName).forEach((index) => state.visibleKeys.delete(keyVisibilityId(poolName, index)));
+  state.selectedRows.keys.clear();
+  renderKeys();
+}
+
+function selectedKeyIndexes(poolName) {
+  return [...state.selectedRows.keys]
+    .map((id) => id.match(new RegExp(`^key:${escapeRegExp(poolName)}:(\\d+)$`)))
+    .filter(Boolean)
+    .map((match) => Number(match[1]));
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
 function updateClientAuthEnabled(enabled) {
@@ -648,30 +1268,62 @@ function deleteClientToken(index) {
 }
 
 async function saveConfig() {
+  state.saving = true;
+  syncSaveButton();
   setStatus("保存中");
-  await api("/__gateway/admin/config", { method: "PUT", body: JSON.stringify(state.config) });
-  await loadAll();
-  setStatus("已保存");
-  setTimeout(() => setStatus(""), 1200);
+  try {
+    await api("/__gateway/admin/config", { method: "PUT", body: JSON.stringify(state.config) });
+    state.dirty = false;
+    showToast("配置已保存并热重载", "success");
+    await loadAll();
+    setStatus("已保存");
+    setTimeout(() => setStatus(""), 1200);
+  } catch (error) {
+    setStatus(error.message);
+    showToast(`保存失败：${error.message}`, "error");
+    throw error;
+  } finally {
+    state.saving = false;
+    syncSaveButton();
+  }
 }
 
 async function refreshLogs() {
+  state.logsLoading = true;
+  state.logsError = "";
+  renderLogs();
   const query = new URLSearchParams({ limit: "160" });
   if (state.logFilters.kind) query.set("kind", state.logFilters.kind);
   if (state.logFilters.level) query.set("level", state.logFilters.level);
   if (state.logFilters.platform) query.set("platform", state.logFilters.platform);
-  const response = await api(`/__gateway/admin/logs?${query.toString()}`);
-  state.logs = response.events || [];
-  renderLogs();
+  try {
+    const response = await api(`/__gateway/admin/logs?${query.toString()}`);
+    state.logs = response.events || [];
+    state.logsError = "";
+  } catch (error) {
+    state.logsError = error.message;
+    showToast(`日志加载失败：${error.message}`, "error");
+    throw error;
+  } finally {
+    state.logsLoading = false;
+    renderLogs();
+  }
 }
 
 async function clearLogs() {
   if (!window.confirm("确认清空全部日志？")) return;
   setStatus("清空中");
-  await api("/__gateway/admin/logs", { method: "DELETE" });
-  await refreshLogs();
-  setStatus("已清空");
-  setTimeout(() => setStatus(""), 1200);
+  try {
+    await api("/__gateway/admin/logs", { method: "DELETE" });
+    await refreshLogs();
+    setStatus("已清空");
+    showToast("日志已清空", "success");
+    setTimeout(() => setStatus(""), 1200);
+  } catch (error) {
+    setStatus(error.message);
+    showToast(`清空失败：${error.message}`, "error");
+    throw error;
+  }
 }
 
 document.querySelector("#login-form").addEventListener("submit", async (event) => {
@@ -689,6 +1341,16 @@ document.querySelectorAll("[data-view]").forEach((tab) => {
     state.view = tab.dataset.view;
     render();
   });
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && state.drawer) closeDrawer();
+});
+
+window.addEventListener("beforeunload", (event) => {
+  if (!state.dirty) return;
+  event.preventDefault();
+  event.returnValue = "";
 });
 
 $("#refresh").addEventListener("click", () => loadAll().catch((error) => setStatus(error.message)));
