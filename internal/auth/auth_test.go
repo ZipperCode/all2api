@@ -78,6 +78,35 @@ func TestAuthorize_AuthorizationTakesPrecedence(t *testing.T) {
 	}
 }
 
+func TestAuthorize_CustomHeader(t *testing.T) {
+	a := NewWithHeader(true, []string{"client-secret"}, "X-API-Key")
+	req, _ := http.NewRequest(http.MethodGet, "/weather", nil)
+	req.Header.Set("X-API-Key", "client-secret")
+	if err := a.Authorize(req); err != nil {
+		t.Errorf("Authorize custom header = %v, want nil", err)
+	}
+
+	req.Header.Set("X-API-Key", "wrong")
+	if err := a.Authorize(req); err == nil {
+		t.Error("Authorize custom header wrong token = nil, want error")
+	}
+
+	req.Header.Del("X-API-Key")
+	req.Header.Set("Authorization", "Bearer client-secret")
+	if err := a.Authorize(req); err == nil {
+		t.Error("Authorize custom header with fallback Authorization = nil, want error")
+	}
+}
+
+func TestAuthorize_CustomAuthorizationHeaderStripsBearer(t *testing.T) {
+	a := NewWithHeader(true, []string{"client-secret"}, "Authorization")
+	req, _ := http.NewRequest(http.MethodGet, "/weather", nil)
+	req.Header.Set("Authorization", "Bearer client-secret")
+	if err := a.Authorize(req); err != nil {
+		t.Errorf("Authorize Authorization custom header = %v, want nil", err)
+	}
+}
+
 func TestExtractClientToken(t *testing.T) {
 	// Authorization 优先
 	r1, _ := http.NewRequest(http.MethodGet, "/", nil)

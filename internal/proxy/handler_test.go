@@ -27,7 +27,7 @@ func newTestPool() *keypool.Pool {
 	})
 }
 
-// newTestHandler 把上游注册为名为 "test" 的 legacy workspace/platform。
+// newTestHandler 把上游注册为名为 "test" 的 legacy workspace/namespace。
 // 测试请求路径需带 /test 前缀（如 /test/fixtures）。
 func newTestHandler(t *testing.T, upstreamURL string, pool *keypool.Pool) *Handler {
 	t.Helper()
@@ -65,7 +65,7 @@ func TestServeHTTP_SuccessForwards(t *testing.T) {
 	if rec.Body.String() != `{"response":[]}` {
 		t.Errorf("body = %q", rec.Body.String())
 	}
-	// workspace 前缀必须被剥离：上游应收到 /fixtures 而非 /test/fixtures。
+	// namespace 前缀必须被剥离：上游应收到 /fixtures 而非 /test/fixtures。
 	if gotPath != "/fixtures" {
 		t.Errorf("upstream path = %q, want /fixtures (workspace prefix stripped)", gotPath)
 	}
@@ -79,7 +79,7 @@ func TestServeHTTP_SuccessForwards(t *testing.T) {
 	}
 }
 
-// TestServeHTTP_UnknownWorkspace404 验证未知 platform 前缀返回 404。
+// TestServeHTTP_UnknownWorkspace404 验证未知 namespace 前缀返回 404。
 func TestServeHTTP_UnknownWorkspace404(t *testing.T) {
 	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
@@ -88,11 +88,11 @@ func TestServeHTTP_UnknownWorkspace404(t *testing.T) {
 
 	h := newTestHandler(t, upstream.URL, newTestPool())
 	rec := httptest.NewRecorder()
-	// "basketball" 未注册（只注册了 "test"）
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/basketball/games", nil))
+	// "api-sports" 未注册（只注册了 "test"）
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/api-sports/status", nil))
 
 	if rec.Code != http.StatusNotFound {
-		t.Errorf("status = %d, want 404 for unknown platform", rec.Code)
+		t.Errorf("status = %d, want 404 for unknown namespace", rec.Code)
 	}
 	var body errorResponse
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
@@ -103,37 +103,37 @@ func TestServeHTTP_UnknownWorkspace404(t *testing.T) {
 	}
 }
 
-// TestServeHTTP_MultiWorkspaceRouting 验证不同 legacy workspace/platform 前缀路由到各自上游。
+// TestServeHTTP_MultiWorkspaceRouting 验证不同 legacy workspace/namespace 前缀路由到各自上游。
 func TestServeHTTP_MultiWorkspaceRouting(t *testing.T) {
-	footballSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	apiSportsSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte("from-football:" + r.URL.Path))
+		_, _ = w.Write([]byte("from-api-sports:" + r.URL.Path))
 	}))
-	defer footballSrv.Close()
-	basketSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	defer apiSportsSrv.Close()
+	weatherSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(200)
-		_, _ = w.Write([]byte("from-basketball:" + r.URL.Path))
+		_, _ = w.Write([]byte("from-weather:" + r.URL.Path))
 	}))
-	defer basketSrv.Close()
+	defer weatherSrv.Close()
 
 	h := NewHandler(Config{
 		Workspaces: map[string]WorkspaceUpstream{
-			"football":   {BaseURL: footballSrv.URL, Timeout: 5 * time.Second},
-			"basketball": {BaseURL: basketSrv.URL, Timeout: 5 * time.Second},
+			"api-sports": {BaseURL: apiSportsSrv.URL, Timeout: 5 * time.Second},
+			"weather":    {BaseURL: weatherSrv.URL, Timeout: 5 * time.Second},
 		},
 		MaxRetries: 3,
 	}, newTestPool(), auth.New(false, nil))
 
 	rec1 := httptest.NewRecorder()
-	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/football/fixtures", nil))
-	if rec1.Body.String() != "from-football:/fixtures" {
-		t.Errorf("football route = %q, want from-football:/fixtures", rec1.Body.String())
+	h.ServeHTTP(rec1, httptest.NewRequest(http.MethodGet, "/api-sports/status", nil))
+	if rec1.Body.String() != "from-api-sports:/status" {
+		t.Errorf("api-sports route = %q, want from-api-sports:/status", rec1.Body.String())
 	}
 
 	rec2 := httptest.NewRecorder()
-	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/basketball/games", nil))
-	if rec2.Body.String() != "from-basketball:/games" {
-		t.Errorf("basketball route = %q, want from-basketball:/games", rec2.Body.String())
+	h.ServeHTTP(rec2, httptest.NewRequest(http.MethodGet, "/weather/forecast", nil))
+	if rec2.Body.String() != "from-weather:/forecast" {
+		t.Errorf("weather route = %q, want from-weather:/forecast", rec2.Body.String())
 	}
 }
 
@@ -427,6 +427,55 @@ func TestServeHTTP_GenericPlatformUsesOwnProviderAndPool(t *testing.T) {
 	}
 }
 
+func TestServeHTTP_GenericPlatformClientAuthUsesOfficialHeader(t *testing.T) {
+	var gotAuth string
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotAuth = r.Header.Get("Authorization")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	}))
+	defer upstream.Close()
+
+	genericProvider, err := provider.New(provider.Config{
+		Type: provider.TypeGenericHTTP,
+		Auth: provider.HeaderAuthConfig{Header: "Authorization", Prefix: "Bearer"},
+	})
+	if err != nil {
+		t.Fatalf("provider.New: %v", err)
+	}
+	pool := keypool.New([]keypool.KeyEntry{{Label: "generic-key", Key: "upstream-secret"}}, keypool.Options{
+		SwitchThreshold:   1,
+		RateLimitCooldown: time.Minute,
+		ErrorCooldown:     time.Minute,
+		MaxErrorCount:     3,
+	})
+	h := NewHandler(Config{
+		Platforms: map[string]PlatformUpstream{
+			"weather": {
+				BaseURL:          upstream.URL,
+				Timeout:          5 * time.Second,
+				Provider:         genericProvider,
+				Pool:             pool,
+				PoolName:         "weather-pool",
+				ClientAuthHeader: "Authorization",
+			},
+		},
+		MaxRetries: 1,
+	}, nil, auth.New(true, []string{"client-secret"}))
+
+	req := httptest.NewRequest(http.MethodGet, "/weather/forecast", nil)
+	req.Header.Set("Authorization", "Bearer client-secret")
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 body=%s", rec.Code, rec.Body.String())
+	}
+	if gotAuth != "Bearer upstream-secret" {
+		t.Errorf("upstream Authorization = %q, want Bearer upstream-secret", gotAuth)
+	}
+}
+
 func TestServeHTTP_PlatformWithoutPoolReturns500(t *testing.T) {
 	h := NewHandler(Config{
 		Platforms: map[string]PlatformUpstream{
@@ -460,12 +509,11 @@ func TestSplitPlatform(t *testing.T) {
 		wantWS  string
 		wantRst string
 	}{
-		{"/football/fixtures", "football", "/fixtures"},
-		{"/football/fixtures/123", "football", "/fixtures/123"},
-		{"/football", "football", "/"},
+		{"/api-sports/status", "api-sports", "/status"},
+		{"/api-sports/countries", "api-sports", "/countries"},
 		{"/", "", "/"},
 		{"", "", "/"},
-		{"/basketball/games", "basketball", "/games"},
+		{"/weather/forecast", "weather", "/forecast"},
 	}
 	for _, c := range cases {
 		gotWS, gotRst := splitPlatform(c.path)

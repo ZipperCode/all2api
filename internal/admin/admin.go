@@ -67,6 +67,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.serveUI(w, r)
 		return
 	}
+	if strings.HasPrefix(r.URL.Path, "/__docs") {
+		h.serveDocsUI(w, r)
+		return
+	}
 	switch r.URL.Path {
 	case "/__gateway/status":
 		h.handleStatus(w, r)
@@ -80,8 +84,8 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.requireAdmin(w, r, h.handleConfig)
 	case "/__gateway/admin/logs":
 		h.requireAdmin(w, r, h.handleLogs)
-	case "/__gateway/admin/docs":
-		h.requireAdmin(w, r, h.handleDocs)
+	case "/__gateway/docs":
+		h.handleDocs(w, r)
 	default:
 		http.NotFound(w, r)
 	}
@@ -134,6 +138,18 @@ func (h *Handler) serveUI(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Path == "/__admin" {
 		http.Redirect(w, r, "/__admin/", http.StatusFound)
 		return
+	}
+	h.ui.ServeHTTP(w, r)
+}
+
+func (h *Handler) serveDocsUI(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path == "/__docs" {
+		http.Redirect(w, r, "/__docs/", http.StatusFound)
+		return
+	}
+	if r.URL.Path == "/__docs/" {
+		r = r.Clone(r.Context())
+		r.URL.Path = "/__docs/docs.html"
 	}
 	h.ui.ServeHTTP(w, r)
 }
@@ -317,5 +333,15 @@ func staticHandler() http.Handler {
 	if err != nil {
 		panic(err)
 	}
-	return http.StripPrefix("/__admin/", http.FileServer(http.FS(sub)))
+	files := http.FileServer(http.FS(sub))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/__admin/"):
+			http.StripPrefix("/__admin/", files).ServeHTTP(w, r)
+		case strings.HasPrefix(r.URL.Path, "/__docs/"):
+			http.StripPrefix("/__docs/", files).ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	})
 }

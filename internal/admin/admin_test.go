@@ -102,7 +102,7 @@ func newConsoleHandler(t *testing.T) (*Handler, *gateway.Manager, *logstore.Stor
 	cfg := &config.Config{
 		Server: config.ServerConfig{Host: "127.0.0.1", Port: 8080},
 		Platforms: map[string]config.PlatformConfig{
-			"football": {
+			"api-sports": {
 				Type:           "api_sports",
 				BaseURL:        "https://v3.football.api-sports.io",
 				TimeoutSeconds: 30,
@@ -197,20 +197,27 @@ func TestAdminConfigUpdateAndDocs(t *testing.T) {
 	}
 
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/__gateway/admin/docs", nil)
-	req.Header.Set("Authorization", "Bearer admin-secret")
-	h.ServeHTTP(rec, req)
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/__gateway/docs", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("docs status = %d, want 200", rec.Code)
 	}
 	if !strings.Contains(rec.Body.String(), "weather") {
 		t.Errorf("docs body missing weather: %s", rec.Body.String())
 	}
+
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/__docs/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("docs UI status = %d, want 200", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "all2api 文档") {
+		t.Errorf("docs UI body missing title: %s", rec.Body.String())
+	}
 }
 
 func TestAdminLogsReadAndClear(t *testing.T) {
 	h, _, events := newConsoleHandler(t)
-	events.Record(logstore.Event{Kind: "proxy", Level: "info", Platform: "football", Message: "ok"})
+	events.Record(logstore.Event{Kind: "proxy", Level: "info", Platform: "api-sports", Message: "ok"})
 
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodGet, "/__gateway/admin/logs?kind=proxy", nil)
@@ -219,8 +226,8 @@ func TestAdminLogsReadAndClear(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("logs status = %d, want 200", rec.Code)
 	}
-	if !strings.Contains(rec.Body.String(), "football") {
-		t.Errorf("logs body missing football: %s", rec.Body.String())
+	if !strings.Contains(rec.Body.String(), "api-sports") {
+		t.Errorf("logs body missing api-sports: %s", rec.Body.String())
 	}
 
 	rec = httptest.NewRecorder()

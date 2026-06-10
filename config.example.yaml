@@ -2,15 +2,15 @@ server:
   host: "0.0.0.0"
   port: 8080
 
-# platforms：下游请求路径 /<platform>/<原路径> 按 platform 选上游。
-# 每个 platform 绑定一个 provider 类型和一个 credential_pool。
+# platforms：下游请求路径 /<namespace>/<原路径> 按站点命名空间选上游。
+# 每个 namespace 绑定一个 provider 类型和一个 credential_pool。
 platforms:
-  football:
+  api-sports:
     type: "api_sports"
     base_url: "https://v3.football.api-sports.io"
     timeout_seconds: 30
     credential_pool: "api-sports"
-  basketball:
+  api-basketball:
     type: "api_sports"
     base_url: "https://v1.basketball.api-sports.io"
     timeout_seconds: 30
@@ -56,8 +56,11 @@ management:
   log_read_limit: 500
 
 client_auth:
-  enabled: false
-  # tokens: ["future-token-1"]
+  # 开启后，下游调用网关需要使用这里的客户端密钥。
+  # 认证头保持站点官方方式，例如 API-Sports 用 x-apisports-key。
+  enabled: true
+  tokens:
+    - "client-token-1"
 
 logging:
   level: "info"

@@ -4,17 +4,16 @@ const state = {
   overview: null,
   config: null,
   logs: [],
-  docs: null,
   dirty: false,
+  selectedProvider: "",
+  visibleKeys: new Set(),
   logFilters: { kind: "", level: "", platform: "" },
 };
 
 const views = {
   dashboard: ["Runtime", "控制台"],
-  platforms: ["Routing", "平台"],
-  keys: ["Credentials", "密钥池"],
+  keys: ["Credentials", "密钥管理"],
   logs: ["Audit", "日志"],
-  docs: ["Reference", "文档"],
 };
 
 const $ = (selector) => document.querySelector(selector);
@@ -76,26 +75,25 @@ async function login(key) {
 
 async function loadAll() {
   setStatus("加载中");
-  const [overview, config, logs, docs] = await Promise.all([
+  const [overview, config, logs] = await Promise.all([
     api("/__gateway/admin/overview"),
     api("/__gateway/admin/config"),
     api("/__gateway/admin/logs?limit=160"),
-    api("/__gateway/admin/docs"),
   ]);
   state.overview = overview;
   state.config = config;
   state.logs = logs.events || [];
-  state.docs = docs;
   state.dirty = false;
   render();
   setStatus("");
 }
 
 function render() {
+  if (!views[state.view]) state.view = "dashboard";
   const [kicker, title] = views[state.view];
   $("#view-kicker").textContent = kicker;
   $("#view-title").textContent = title;
-  $("#save-config").classList.toggle("hidden", !["platforms", "keys"].includes(state.view));
+  $("#save-config").classList.toggle("hidden", state.view !== "keys");
   document.querySelectorAll(".nav-tab").forEach((tab) => {
     const active = tab.dataset.view === state.view;
     tab.classList.toggle("active", active);
@@ -105,10 +103,8 @@ function render() {
   $(`#${state.view}-view`).classList.add("active");
 
   renderDashboard();
-  renderPlatforms();
   renderKeys();
   renderLogs();
-  renderDocs();
 }
 
 function renderDashboard() {
@@ -121,7 +117,7 @@ function renderDashboard() {
         node("section", { class: "card" }, metricGrid(state.overview)),
         node("section", { class: "card dark" }, runtimeList(state.overview)),
       ),
-      section("平台状态", "当前请求前缀与上游配置", platformOverviewTable(state.overview.platforms || [])),
+      section("命名空间状态", "当前站点前缀与上游配置", platformOverviewTable(state.overview.platforms || [])),
       section("密钥状态", "运行态密钥健康度", poolStatusTable(state.overview.credential_pools || [])),
     ),
   );
@@ -141,7 +137,7 @@ function runtimeRow(label, value) {
 
 function metricGrid(overview) {
   return node("div", { class: "metric-grid" },
-    metricTile("平台", overview.platform_count),
+    metricTile("命名空间", overview.platform_count),
     metricTile("密钥池", overview.credential_pool_count),
     metricTile("总密钥", overview.key_count),
     metricTile("可用密钥", overview.active_key_count),
@@ -156,7 +152,7 @@ function metricTile(label, value) {
 function platformOverviewTable(platforms) {
   if (!platforms.length) return empty();
   return table(
-    ["平台", "类型", "Base URL", "密钥池", "超时", "认证头"],
+    ["命名空间", "类型", "Base URL", "密钥池", "超时", "认证头"],
     platforms.map((platform) => [
       strongText(platform.name),
       statusPill(platform.type),
@@ -168,98 +164,278 @@ function platformOverviewTable(platforms) {
   );
 }
 
-function renderPlatforms() {
-  const root = $("#platforms-view");
-  if (!state.config) return;
-  const platforms = platformEntries();
-  root.replaceChildren(
-    stack(
-      section("平台配置", "修改后点击右上角保存配置",
-        node("div", { class: "toolbar" },
-          node("div", { class: "tool-cluster" }, button("新增平台", "primary", addPlatform)),
-        ),
-        platformEditor(platforms),
-      ),
-    ),
-  );
-}
-
 function platformEntries() {
   return Object.entries(state.config?.platforms || {})
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([name, config]) => ({ name, ...config }));
 }
 
-function platformEditor(platforms) {
-  if (!platforms.length) return empty();
-  return node("div", { class: "table-wrap" },
-    node("table", {},
-      node("thead", {}, node("tr", {}, ["名称", "类型", "Base URL", "密钥池", "超时", "Auth Header", "Auth Prefix", "操作"].map((heading) => node("th", {}, heading)))),
-      node("tbody", {}, platforms.map((platform) => node("tr", {},
-        cell(input(platform.name, (value) => renamePlatform(platform.name, value), "table-input", "text", "", "change", { "aria-label": "平台名称" })),
-        cell(select(platform.type, ["api_sports", "generic_http"], (value) => updatePlatform(platform.name, "type", value), "平台类型")),
-        cell(input(platform.base_url || "", (value) => updatePlatform(platform.name, "base_url", value), "table-input", "text", "", "input", { "aria-label": "Base URL" })),
-        cell(input(platform.credential_pool || "", (value) => updatePlatform(platform.name, "credential_pool", value), "table-input", "text", "", "input", { "aria-label": "密钥池" })),
-        cell(input(platform.timeout_seconds || 30, (value) => updatePlatform(platform.name, "timeout_seconds", Number(value)), "table-input", "number", "", "input", { "aria-label": "超时秒数" })),
-        cell(input(platform.auth?.header || "", (value) => updatePlatformAuth(platform.name, "header", value), "table-input", "text", "", "input", { "aria-label": "认证头" })),
-        cell(input(platform.auth?.prefix || "", (value) => updatePlatformAuth(platform.name, "prefix", value), "table-input", "text", "", "input", { "aria-label": "认证前缀" })),
-        cell(button("删除", "text danger", () => deletePlatform(platform.name))),
-      ))),
-    ),
-  );
-}
-
 function renderKeys() {
   const root = $("#keys-view");
   if (!state.config) return;
-  const pools = Object.entries(state.config.credential_pools || {}).sort(([a], [b]) => a.localeCompare(b));
+  const providers = platformEntries();
+  const selected = ensureSelectedProvider(providers);
+  const unboundPools = credentialPoolEntries().filter(([name]) => !providers.some((provider) => provider.credential_pool === name));
+
   root.replaceChildren(
     stack(
-      section("密钥池", "修改后点击右上角保存配置",
-        node("div", { class: "toolbar" },
-          node("div", { class: "tool-cluster" }, button("新增密钥池", "primary", addPool)),
+      section("提供商密钥", "选择当前配置里的提供商，再维护它绑定的上游密钥",
+        node("div", { class: "provider-layout" },
+          providerRail(providers),
+          credentialPanel(selected, providers),
         ),
-        node("div", { class: "pool-stack" }, pools.length ? pools.map(([name, pool]) => poolCard(name, pool)) : empty()),
       ),
+      section("认证设置", "管理调用网关时需要使用的客户端密钥；请求头保持各站点官方认证方式",
+        clientAuthSettings(providers),
+      ),
+      unboundPools.length ? section("未绑定密钥池", "这些密钥池当前没有提供商引用，需在配置文件绑定后才会参与转发", unboundPoolTable(unboundPools)) : null,
     ),
   );
 }
 
-function poolCard(name, pool) {
-  const keys = pool.keys || [];
-  return node("article", { class: "pool-card" },
-    node("div", { class: "pool-card-header" },
+function credentialPoolEntries() {
+  return Object.entries(state.config?.credential_pools || {}).sort(([a], [b]) => a.localeCompare(b));
+}
+
+function ensureSelectedProvider(providers) {
+  if (!providers.length) {
+    state.selectedProvider = "";
+    return null;
+  }
+  const selected = providers.find((provider) => provider.name === state.selectedProvider);
+  if (selected) return selected;
+  state.selectedProvider = providers[0].name;
+  return providers[0];
+}
+
+function providerRail(providers) {
+  return node("aside", { class: "provider-rail", "aria-label": "提供商列表" },
+    node("div", { class: "rail-header" },
       node("div", {},
-        node("h3", {}, name),
-        node("p", { class: "muted" }, `${keys.length} keys`),
+        node("p", { class: "eyebrow" }, "Providers"),
+        node("strong", {}, `${providers.length} 个提供商`),
       ),
-      node("div", { class: "inline-actions" },
-        button("新增密钥", "secondary", () => addKey(name)),
-        button("删除池", "text danger", () => deletePool(name)),
-      ),
+      statusPill(`${activeProviderCount(providers)} active`),
     ),
-    node("div", { class: "key-list" }, keys.length ? keys.map((key, index) => keyRow(name, key, index)) : empty()),
+    providers.length ? node("div", { class: "provider-list" }, providers.map(providerItem)) : empty(),
   );
 }
 
-function keyRow(poolName, key, index) {
-  return node("div", { class: "key-row" },
-    field("Label", input(key.label || "", (value) => updateKey(poolName, index, "label", value), "table-input", "text", "", "input", { "aria-label": "密钥标签" })),
-    field("Key", input(key.key || "", (value) => updateKey(poolName, index, "key", value), "table-input", "password", "", "input", { "aria-label": "密钥值" })),
-    node("div", { class: "inline-actions" }, button("删除", "text danger", () => deleteKey(poolName, index))),
+function providerItem(provider) {
+  const active = provider.name === state.selectedProvider;
+  const health = keyHealth(provider.credential_pool);
+  return node("button", {
+    class: `provider-item${active ? " active" : ""}`,
+    type: "button",
+    "aria-pressed": active ? "true" : "false",
+    onClick: () => {
+      state.selectedProvider = provider.name;
+      renderKeys();
+    },
+  },
+    node("div", { class: "provider-item-main" },
+      node("strong", {}, provider.name),
+      statusPill(provider.type || "provider"),
+    ),
+    node("span", { class: "provider-url", title: text(provider.base_url, "-") }, text(provider.base_url, "-")),
+    node("div", { class: "provider-foot" },
+      node("span", {}, provider.credential_pool || "未绑定密钥池"),
+      node("span", {}, `${health.active}/${health.total} 可用`),
+    ),
   );
+}
+
+function credentialPanel(provider, providers) {
+  if (!provider) {
+    return node("div", { class: "credential-panel" }, empty());
+  }
+  const poolName = provider.credential_pool || "";
+  const pool = configPool(poolName);
+  const linked = providers.filter((item) => item.credential_pool === poolName);
+  const keys = pool.keys || [];
+
+  return node("article", { class: "credential-panel" },
+    node("div", { class: "credential-hero" },
+      node("div", {},
+        node("p", { class: "eyebrow" }, "Selected Provider"),
+        node("h3", {}, provider.name),
+        node("p", { class: "credential-url", title: text(provider.base_url, "-") }, text(provider.base_url, "-")),
+      ),
+      node("div", { class: "panel-actions" },
+        poolName ? button("新增密钥", "primary", () => addKey(poolName)) : node("button", { class: "button primary", type: "button", disabled: "disabled" }, "未绑定密钥池"),
+      ),
+    ),
+    node("div", { class: "provider-details" },
+      kv("请求前缀", `/${provider.name}`),
+      kv("Provider", provider.type),
+      kv("密钥池", poolName || "-"),
+      kv("认证头", authLabel(provider)),
+    ),
+    linkedNamespaces(linked),
+    node("div", { class: "key-management-body" },
+      keys.length ? keyManagementTable(poolName, keys) : emptyKeys(poolName),
+    ),
+  );
+}
+
+function linkedNamespaces(providers) {
+  return node("div", { class: "linked-namespaces" },
+    node("span", {}, "共享命名空间"),
+    providers.map((provider) => node("span", { class: "chip" }, `/${provider.name}`)),
+  );
+}
+
+function keyManagementTable(poolName, keys) {
+  return table(
+    ["Label", "密钥值", "状态", "Masked", "Daily", "Minute", "错误", "操作"],
+    keys.map((key, index) => {
+      const runtime = runtimeKey(poolName, key, index);
+      const visible = state.visibleKeys.has(keyVisibilityId(poolName, index));
+      return [
+        input(key.label || "", (value) => updateKey(poolName, index, "label", value), "table-input", "text", "", "input", { "aria-label": "密钥标签" }),
+        node("div", { class: "secret-field" },
+          input(key.key || "", (value) => updateKey(poolName, index, "key", value), key.key ? "table-input" : "table-input input-warning", visible ? "text" : "password", "粘贴上游 API Key", "input", { "aria-label": "密钥值" }),
+          iconButton(visible ? "隐藏" : "查看", visible ? "Hide key" : "Show key", () => toggleKeyVisibility(poolName, index), visible ? "eye-off" : "eye"),
+        ),
+        keyRuntimePill(key, runtime),
+        truncate(runtime?.masked_key || maskSecret(key.key)),
+        runtime?.daily_remaining ?? "-",
+        runtime?.minute_remaining ?? "-",
+        truncate(runtime?.last_error || "-"),
+        node("div", { class: "inline-actions" }, button("删除", "text danger", () => deleteKey(poolName, index))),
+      ];
+    }),
+    "credential-table",
+  );
+}
+
+function clientAuthSettings(providers) {
+  state.config.client_auth ||= { enabled: false, tokens: [] };
+  state.config.client_auth.tokens ||= [];
+  return node("div", { class: "settings-panel" },
+    node("div", { class: "settings-row" },
+      node("div", {},
+        node("h3", {}, "客户端认证"),
+        node("p", { class: "muted" }, "开启后，下游必须使用这里配置的客户端密钥调用网关。"),
+      ),
+      node("label", { class: "switch-field" },
+        node("input", { type: "checkbox", checked: state.config.client_auth.enabled ? "checked" : null, onChange: (event) => updateClientAuthEnabled(event.target.checked) }),
+        node("span", {}, state.config.client_auth.enabled ? "已开启" : "未开启"),
+      ),
+    ),
+    authHeaderTable(providers),
+    node("div", { class: "token-list" },
+      state.config.client_auth.tokens.length ? state.config.client_auth.tokens.map((token, index) => tokenRow(token, index)) : empty(),
+    ),
+    node("div", { class: "toolbar" },
+      node("div", { class: "muted" }, "保存配置后立即热重载。启用但无 token 时会拒绝所有业务请求。"),
+      button("新增客户端密钥", "secondary", addClientToken),
+    ),
+  );
+}
+
+function authHeaderTable(providers) {
+  return table(
+    ["命名空间", "官方认证头", "客户端示例"],
+    providers.map((provider) => [
+      strongText(`/${provider.name}`),
+      authLabel(provider),
+      truncate(`${authHeader(provider)}: ${authValuePlaceholder(provider)}`),
+    ]),
+    "compact-table",
+  );
+}
+
+function tokenRow(token, index) {
+  return node("div", { class: "token-row" },
+    field("客户端密钥", input(token, (value) => updateClientToken(index, value), "table-input", "text", "client token", "input", { "aria-label": "客户端密钥" })),
+    node("div", { class: "inline-actions" }, button("删除", "text danger", () => deleteClientToken(index))),
+  );
+}
+
+function emptyKeys(poolName) {
+  return node("div", { class: "empty-state" },
+    poolName ? "当前提供商还没有密钥，点击右上角新增密钥。" : "当前提供商没有绑定密钥池，请先在配置文件中绑定 credential_pool。",
+  );
+}
+
+function unboundPoolTable(pools) {
+  return table(
+    ["密钥池", "密钥数", "状态"],
+    pools.map(([name, pool]) => [strongText(name), (pool.keys || []).length, statusPill("未绑定")]),
+    "compact-table",
+  );
+}
+
+function configPool(poolName) {
+  if (!poolName) return { keys: [] };
+  return state.config?.credential_pools?.[poolName] || { keys: [] };
+}
+
+function ensureConfigPool(poolName) {
+  state.config.credential_pools ||= {};
+  state.config.credential_pools[poolName] ||= { keys: [] };
+  return state.config.credential_pools[poolName];
+}
+
+function runtimePool(poolName) {
+  return (state.overview?.credential_pools || []).find((pool) => pool.name === poolName) || { keys: [] };
+}
+
+function runtimeKey(poolName, key, index) {
+  const runtimeKeys = runtimePool(poolName).keys || [];
+  return runtimeKeys.find((item) => item.label === key.label) || runtimeKeys[index] || null;
+}
+
+function keyRuntimePill(key, runtime) {
+  if (!key.key) return statusPill("待填写");
+  if (!runtime?.status) return statusPill("待保存");
+  return statusPill(runtime.status);
+}
+
+function keyHealth(poolName) {
+  const configured = configPool(poolName).keys || [];
+  const runtimeKeys = runtimePool(poolName).keys || [];
+  const active = runtimeKeys.filter((key) => key.status === "active").length;
+  return { total: configured.length, active };
+}
+
+function activeProviderCount(providers) {
+  return providers.filter((provider) => keyHealth(provider.credential_pool).active > 0).length;
+}
+
+function authLabel(provider) {
+  const header = authHeader(provider);
+  const prefix = provider.auth?.prefix || provider.auth_prefix || "";
+  return prefix ? `${header}: ${prefix}` : header;
+}
+
+function authHeader(provider) {
+  return provider.auth?.header || provider.auth_header || "x-apisports-key";
+}
+
+function authValuePlaceholder(provider) {
+  const prefix = provider.auth?.prefix || provider.auth_prefix || "";
+  return prefix ? `${prefix} <client-key>` : "<client-key>";
+}
+
+function maskSecret(value) {
+  const raw = text(value);
+  if (!raw) return "未填写";
+  if (raw.length <= 8) return "********";
+  return `${raw.slice(0, 4)}...${raw.slice(-4)}`;
 }
 
 function renderLogs() {
   const root = $("#logs-view");
   root.replaceChildren(
     stack(
-      section("事件日志", "按类型、级别和平台过滤",
+      section("事件日志", "按类型、级别和命名空间过滤",
         node("div", { class: "toolbar" },
           node("div", { class: "filters" },
             select(state.logFilters.kind, ["", "proxy", "admin"], (value) => { state.logFilters.kind = value; refreshLogs(); }, "类型"),
             select(state.logFilters.level, ["", "info", "warn", "error"], (value) => { state.logFilters.level = value; refreshLogs(); }, "级别"),
-            input(state.logFilters.platform, (value) => { state.logFilters.platform = value; refreshLogs(); }, "table-input", "text", "平台", "input", { "aria-label": "平台过滤" }),
+            input(state.logFilters.platform, (value) => { state.logFilters.platform = value; refreshLogs(); }, "table-input", "text", "命名空间", "input", { "aria-label": "命名空间过滤" }),
           ),
           node("div", { class: "inline-actions" },
             button("刷新日志", "secondary", refreshLogs),
@@ -275,7 +451,7 @@ function renderLogs() {
 function eventTable(events) {
   if (!events.length) return empty();
   return table(
-    ["时间", "类型", "级别", "平台", "消息", "状态码"],
+    ["时间", "类型", "级别", "命名空间", "消息", "状态码"],
     events.map((event) => [
       formatTime(event.time),
       statusPill(event.kind || "event"),
@@ -285,46 +461,6 @@ function eventTable(events) {
       event.status_code || "-",
     ]),
     "log-table",
-  );
-}
-
-function renderDocs() {
-  const root = $("#docs-view");
-  if (!state.docs) return;
-  root.replaceChildren(
-    stack(
-      section("平台文档", "按当前运行配置生成",
-        node("div", { class: "doc-grid" }, (state.docs.platforms || []).map(platformDoc)),
-      ),
-      section("管理 API", "后台页面使用的鉴权接口",
-        docsTable(state.docs.admin_endpoints || []),
-      ),
-    ),
-  );
-}
-
-function platformDoc(doc) {
-  return node("article", { class: "doc-card" },
-    node("div", { class: "doc-card-header" },
-      node("div", {},
-        node("h3", {}, doc.name),
-        node("p", { class: "muted" }, `${doc.type} · ${doc.gateway_base_path}`),
-      ),
-      statusPill(doc.credential_pool),
-    ),
-    node("div", { class: "kv-grid" },
-      kv("Upstream", doc.upstream_base_url),
-      kv("Injected auth", `${doc.auth_header}: ${doc.auth_value}`),
-    ),
-    node("pre", {}, doc.example_curl),
-  );
-}
-
-function docsTable(endpoints) {
-  if (!endpoints.length) return empty();
-  return table(
-    ["Method", "Path", "Description"],
-    endpoints.map((endpoint) => [endpoint.method, endpoint.path, endpoint.description]),
   );
 }
 
@@ -391,6 +527,12 @@ function button(label, variant, onClick) {
   return node("button", { class: `button ${variant}`, type: "button", onClick }, label);
 }
 
+function iconButton(label, title, onClick, icon) {
+  return node("button", { class: "icon-button", type: "button", title, "aria-label": label, onClick },
+    node("span", { class: `icon ${icon}`, "aria-hidden": "true" }),
+  );
+}
+
 function kv(label, value) {
   return node("div", { class: "kv" }, node("span", {}, label), node("strong", { title: text(value, "-") }, text(value, "-")));
 }
@@ -435,72 +577,36 @@ function markDirty() {
   setStatus("未保存");
 }
 
-function updatePlatform(name, key, value) {
-  state.config.platforms[name][key] = value;
-  markDirty();
+function keyVisibilityId(poolName, index) {
+  return `${poolName}:${index}`;
 }
 
-function updatePlatformAuth(name, key, value) {
-  state.config.platforms[name].auth ||= {};
-  state.config.platforms[name].auth[key] = value;
-  markDirty();
-}
-
-function renamePlatform(oldName, newName) {
-  const nextName = newName.trim();
-  if (!nextName || oldName === nextName || state.config.platforms[nextName]) return;
-  state.config.platforms[nextName] = state.config.platforms[oldName];
-  delete state.config.platforms[oldName];
-  markDirty();
-  renderPlatforms();
-}
-
-function addPlatform() {
-  state.config.platforms ||= {};
-  let name = "new-platform";
-  let index = 1;
-  while (state.config.platforms[name]) name = `new-platform-${index++}`;
-  const poolName = Object.keys(state.config.credential_pools || {})[0] || "default";
-  state.config.platforms[name] = {
-    type: "generic_http",
-    base_url: "https://api.example.com",
-    timeout_seconds: 30,
-    credential_pool: poolName,
-    auth: { header: "Authorization", prefix: "Bearer" },
-    rate_limit: {},
-  };
-  markDirty();
-  renderPlatforms();
-}
-
-function deletePlatform(name) {
-  delete state.config.platforms[name];
-  markDirty();
-  renderPlatforms();
-}
-
-function addPool() {
-  state.config.credential_pools ||= {};
-  let name = "new-pool";
-  let index = 1;
-  while (state.config.credential_pools[name]) name = `new-pool-${index++}`;
-  state.config.credential_pools[name] = { keys: [] };
-  markDirty();
-  renderKeys();
-}
-
-function deletePool(name) {
-  delete state.config.credential_pools[name];
-  markDirty();
+function toggleKeyVisibility(poolName, index) {
+  const id = keyVisibilityId(poolName, index);
+  if (state.visibleKeys.has(id)) {
+    state.visibleKeys.delete(id);
+  } else {
+    state.visibleKeys.add(id);
+  }
   renderKeys();
 }
 
 function addKey(poolName) {
-  state.config.credential_pools[poolName].keys ||= [];
-  const next = state.config.credential_pools[poolName].keys.length + 1;
-  state.config.credential_pools[poolName].keys.push({ label: `key-${next}`, key: "" });
+  if (!poolName) return;
+  const pool = ensureConfigPool(poolName);
+  pool.keys ||= [];
+  pool.keys.push({ label: nextKeyLabel(pool.keys), key: "" });
   markDirty();
+  setStatus("已新增密钥，未保存");
   renderKeys();
+}
+
+function nextKeyLabel(keys) {
+  let index = keys.length + 1;
+  let label = `key-${index}`;
+  const labels = new Set(keys.map((key) => key.label));
+  while (labels.has(label)) label = `key-${++index}`;
+  return label;
 }
 
 function updateKey(poolName, index, key, value) {
@@ -510,6 +616,33 @@ function updateKey(poolName, index, key, value) {
 
 function deleteKey(poolName, index) {
   state.config.credential_pools[poolName].keys.splice(index, 1);
+  state.visibleKeys.delete(keyVisibilityId(poolName, index));
+  markDirty();
+  renderKeys();
+}
+
+function updateClientAuthEnabled(enabled) {
+  state.config.client_auth ||= { enabled: false, tokens: [] };
+  state.config.client_auth.enabled = enabled;
+  markDirty();
+  renderKeys();
+}
+
+function addClientToken() {
+  state.config.client_auth ||= { enabled: false, tokens: [] };
+  state.config.client_auth.tokens ||= [];
+  state.config.client_auth.tokens.push("");
+  markDirty();
+  renderKeys();
+}
+
+function updateClientToken(index, value) {
+  state.config.client_auth.tokens[index] = value;
+  markDirty();
+}
+
+function deleteClientToken(index) {
+  state.config.client_auth.tokens.splice(index, 1);
   markDirty();
   renderKeys();
 }

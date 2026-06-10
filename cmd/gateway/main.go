@@ -47,6 +47,8 @@ func main() {
 	mux := http.NewServeMux()
 	mux.Handle("/__admin/", adminHandler)
 	mux.Handle("/__admin", adminHandler)
+	mux.Handle("/__docs/", adminHandler)
+	mux.Handle("/__docs", adminHandler)
 	mux.Handle("/__gateway/", adminHandler)
 	mux.Handle("/", manager)
 

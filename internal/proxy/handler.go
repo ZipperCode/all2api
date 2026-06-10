@@ -16,11 +16,11 @@ import (
 	"all2api/internal/provider"
 )
 
-// splitPlatform separates the public platform prefix from the upstream path.
+// splitPlatform separates the public namespace prefix from the upstream path.
 //
-//	"/football/fixtures?..." → ("football", "/fixtures")
-//	"/football"              → ("football", "/")
-//	"/"  或  ""              → ("", "/")
+//	"/api-sports/fixtures?..." → ("api-sports", "/fixtures")
+//	"/api-sports"              → ("api-sports", "/")
+//	"/"  或  ""                → ("", "/")
 //
 // 剩余路径总是以 "/" 开头，便于直接拼接上游 base_url。
 func splitPlatform(path string) (platform, rest string) {
@@ -40,18 +40,19 @@ type WorkspaceUpstream struct {
 	Timeout time.Duration
 }
 
-// PlatformUpstream describes one public platform prefix.
+// PlatformUpstream describes one public namespace prefix.
 type PlatformUpstream struct {
-	BaseURL  string
-	Timeout  time.Duration
-	Provider provider.Provider
-	Pool     *keypool.Pool
-	PoolName string
+	BaseURL          string
+	Timeout          time.Duration
+	Provider         provider.Provider
+	Pool             *keypool.Pool
+	PoolName         string
+	ClientAuthHeader string
 }
 
 // Config 配置中转 handler。
 type Config struct {
-	// Platforms maps /<platform>/<rest> to its upstream runtime.
+	// Platforms maps /<namespace>/<rest> to its upstream runtime.
 	Platforms map[string]PlatformUpstream
 
 	// Workspaces is the legacy API-Sports-only runtime config.
@@ -60,9 +61,10 @@ type Config struct {
 }
 
 type platformRuntime struct {
-	transport *transport
-	pool      *keypool.Pool
-	poolName  string
+	transport        *transport
+	pool             *keypool.Pool
+	poolName         string
+	clientAuthHeader string
 }
 
 // Handler 是网关的核心中转处理器。
@@ -90,9 +92,10 @@ func NewHandler(cfg Config, defaultPool *keypool.Pool, a *auth.Authenticator) *H
 	runtimes := make(map[string]platformRuntime, len(platforms))
 	for name, upstream := range platforms {
 		runtimes[name] = platformRuntime{
-			transport: newTransport(upstream.BaseURL, upstream.Timeout, upstream.Provider),
-			pool:      upstream.Pool,
-			poolName:  upstream.PoolName,
+			transport:        newTransport(upstream.BaseURL, upstream.Timeout, upstream.Provider),
+			pool:             upstream.Pool,
+			poolName:         upstream.PoolName,
+			clientAuthHeader: upstream.ClientAuthHeader,
 		}
 	}
 	return &Handler{
@@ -116,6 +119,9 @@ func normalizePlatforms(cfg Config, defaultPool *keypool.Pool) map[string]Platfo
 			if upstream.Provider == nil {
 				upstream.Provider = mustAPISportsProvider()
 			}
+			if upstream.ClientAuthHeader == "" {
+				upstream.ClientAuthHeader = upstream.Provider.CredentialHeader()
+			}
 			out[name] = upstream
 		}
 		return out
@@ -125,11 +131,12 @@ func normalizePlatforms(cfg Config, defaultPool *keypool.Pool) map[string]Platfo
 	apiSports := mustAPISportsProvider()
 	for name, ws := range cfg.Workspaces {
 		out[name] = PlatformUpstream{
-			BaseURL:  ws.BaseURL,
-			Timeout:  ws.Timeout,
-			Provider: apiSports,
-			Pool:     defaultPool,
-			PoolName: "default",
+			BaseURL:          ws.BaseURL,
+			Timeout:          ws.Timeout,
+			Provider:         apiSports,
+			Pool:             defaultPool,
+			PoolName:         "default",
+			ClientAuthHeader: apiSports.CredentialHeader(),
 		}
 	}
 	return out
@@ -155,39 +162,40 @@ func (h *Handler) WithEventSink(sink EventSink) *Handler {
 	return h
 }
 
-// ServeHTTP 执行中转管线：认证 → 解析 platform → 缓冲请求体 → 换 key 重试 → 回传。
+// ServeHTTP 执行中转管线：认证 → 解析 namespace → 缓冲请求体 → 换 key 重试 → 回传。
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
 	originalPath := r.URL.Path
-	if err := h.auth.Authorize(r); err != nil {
-		writeJSONError(w, http.StatusUnauthorized, "unauthorized", "client authorization failed", nil, 0)
-		h.recordProxyEvent(logstore.Event{
-			Level:      "warn",
-			Message:    "client authorization failed",
-			Method:     r.Method,
-			Path:       originalPath,
-			StatusCode: http.StatusUnauthorized,
-			DurationMS: time.Since(start).Milliseconds(),
-			Error:      err.Error(),
-			RemoteAddr: r.RemoteAddr,
-		})
-		return
-	}
 
-	// 解析路径前缀 /<platform>/<rest>，选定对应上游 runtime，并把剩余路径设回请求。
+	// 解析路径前缀 /<namespace>/<rest>，选定对应上游 runtime，并把剩余路径设回请求。
 	platform, rest := splitPlatform(r.URL.Path)
 	runtime, ok := h.platforms[platform]
 	if !ok {
 		writeJSONError(w, http.StatusNotFound, "unknown_platform",
-			"unknown platform in path; expected /<platform>/<path>", nil, 0)
+			"unknown namespace in path; expected /<namespace>/<path>", nil, 0)
 		h.recordProxyEvent(logstore.Event{
 			Level:      "warn",
-			Message:    "unknown platform",
+			Message:    "unknown namespace",
 			Platform:   platform,
 			Method:     r.Method,
 			Path:       originalPath,
 			StatusCode: http.StatusNotFound,
 			DurationMS: time.Since(start).Milliseconds(),
+			RemoteAddr: r.RemoteAddr,
+		})
+		return
+	}
+	if err := h.authorize(runtime, r); err != nil {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized", "client authorization failed", nil, 0)
+		h.recordProxyEvent(logstore.Event{
+			Level:      "warn",
+			Message:    "client authorization failed",
+			Platform:   platform,
+			Method:     r.Method,
+			Path:       originalPath,
+			StatusCode: http.StatusUnauthorized,
+			DurationMS: time.Since(start).Milliseconds(),
+			Error:      err.Error(),
 			RemoteAddr: r.RemoteAddr,
 		})
 		return
@@ -401,6 +409,16 @@ func copySafeResponseHeaders(src, dst http.Header) {
 			dst.Add(canonical, v)
 		}
 	}
+}
+
+func (h *Handler) authorize(runtime platformRuntime, r *http.Request) error {
+	if h.auth == nil {
+		return nil
+	}
+	if runtime.clientAuthHeader == "" {
+		return h.auth.Authorize(r)
+	}
+	return auth.NewWithHeader(h.auth.Enabled(), h.auth.Tokens(), runtime.clientAuthHeader).Authorize(r)
 }
 
 var blockedResponseHeaders = map[string]struct{}{

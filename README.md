@@ -1,13 +1,13 @@
 # all2api Gateway
 
-局域网内的通用 API 转发平台。对客户端屏蔽真实上游凭证，按 `/<platform>/<原路径>` 路由到不同上游，并在命名 `credential_pools` 中做多 key 顺序耗尽、自动重试和状态监控。
+局域网内的通用 API 转发平台。对客户端屏蔽真实上游凭证，按 `/<namespace>/<原路径>` 路由到不同上游站点，并在命名 `credential_pools` 中做多 key 顺序耗尽、自动重试和状态监控。
 
 第一版是**纯转发 MVP**：不做请求/响应协议转换，只做路由、客户端认证、上游凭证注入、限额解析、错误分类和换 key 重试。
 
 ## 特性
 
-- **多 platform 路由**：`/<platform>/<path>` 选择上游平台，路径前缀会被剥离后转发。
-- **命名凭证池**：多个 platform 可以共享同一个 `credential_pool`，也可以各自独立。
+- **站点命名空间路由**：`/<namespace>/<path>` 选择上游站点，第一段 namespace 会被剥离后转发。
+- **命名凭证池**：多个 namespace 可以共享同一个 `credential_pool`，也可以各自独立。
 - **平台 provider**：
   - `api_sports`：注入 `x-apisports-key`，解析 API-Sports 额度 header。
   - `generic_http`：可配置任意 Header 凭证，例如 `X-API-Key` 或 `Authorization: Bearer <key>`。
@@ -85,11 +85,16 @@ ALL2API_PORT=18080 docker compose up -d --build
 请求示例：
 
 ```bash
-# API-Sports platform
-curl -H "Authorization: Bearer client-token" \
-  "http://127.0.0.1:8080/football/fixtures?live=all"
+# API-Football / API-Sports namespace
+curl -H "x-apisports-key: client-token" \
+  "http://127.0.0.1:8080/api-sports/fixtures?live=all"
 
-# Generic Header platform，配置中会把 weather pool 的 key 注入为 Authorization: Bearer <key>
+curl -H "x-apisports-key: client-token" \
+  "http://127.0.0.1:8080/api-sports/status"
+curl -H "x-apisports-key: client-token" \
+  "http://127.0.0.1:8080/api-sports/countries?name=England"
+
+# Generic Header namespace，配置中会把 weather pool 的 key 注入为 Authorization: Bearer <key>
 curl -H "Authorization: Bearer client-token" \
   "http://127.0.0.1:8080/weather/forecast?city=shanghai"
 ```
@@ -97,10 +102,10 @@ curl -H "Authorization: Bearer client-token" \
 网关处理流程：
 
 ```text
-/<platform>/<path>
+/<namespace>/<path>
   -> 校验客户端凭证（可关闭）
-  -> 剥离 platform 前缀
-  -> 按 platform 选择 provider + credential_pool
+  -> 剥离 namespace 前缀
+  -> 按 namespace 选择 provider + credential_pool
   -> 选择可用 key
   -> provider 注入上游凭证
   -> 转发到 base_url + /<path>
@@ -113,6 +118,7 @@ curl -H "Authorization: Bearer client-token" \
 
 | 配置 | 说明 |
 |------|------|
+| `platforms.<name>` | 对外请求路径的站点命名空间，例如 `/api-sports/...` |
 | `platforms.<name>.type` | `api_sports` 或 `generic_http` |
 | `platforms.<name>.base_url` | 上游基础地址 |
 | `platforms.<name>.credential_pool` | 引用的命名凭证池 |
@@ -124,16 +130,17 @@ curl -H "Authorization: Bearer client-token" \
 | `management.log_file` | 结构化 JSONL 日志文件 |
 | `management.log_read_limit` | 日志页最大读取条数 |
 | `client_auth.enabled` | 是否校验下游客户端 token |
+| `client_auth.tokens` | 下游调用网关使用的客户端 token 白名单；请求头保持站点官方认证方式 |
 
 ### API-Sports 共享 key
 
 ```yaml
 platforms:
-  football:
+  api-sports:
     type: api_sports
     base_url: "https://v3.football.api-sports.io"
     credential_pool: api-sports
-  basketball:
+  api-basketball:
     type: api_sports
     base_url: "https://v1.basketball.api-sports.io"
     credential_pool: api-sports
@@ -191,7 +198,8 @@ credential_pools:
 | `GET /__gateway/admin/overview` | dashboard 数据 |
 | `GET / PUT /__gateway/admin/config` | 读取/写回配置并热重载 |
 | `GET / DELETE /__gateway/admin/logs` | 查询/清空文件日志 |
-| `GET /__gateway/admin/docs` | 动态接口文档 |
+| `GET /__gateway/docs` | 公开动态接口文档 JSON |
+| `GET /__docs/` | 公开文档页面 |
 
 示例：
 
@@ -224,10 +232,10 @@ curl http://127.0.0.1:8080/__gateway/status
 
 旧版 `workspaces + keys` 配置仍可加载。启动时会自动转换为：
 
-- 每个 `workspaces.<name>` → 一个 `api_sports` platform。
+- 每个 `workspaces.<name>` → 一个 `api_sports` namespace。
 - 顶层 `keys` → `credential_pools.default.keys`。
 
-旧请求路径如 `/football/fixtures` 保持可用。
+旧请求路径如 `/football/fixtures` 只在旧配置继续使用 `workspaces.football` 或 `platforms.football` 时保持可用。新配置建议用站点命名空间，例如 `/api-sports/fixtures`。
 
 ## 测试
 
